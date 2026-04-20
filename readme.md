@@ -19,6 +19,10 @@
 3. **仅截取模式（不提供 `-n`，但提供 `-w` 与 `-d`）**  
    只按时间窗口从原片截取片段输出，**不进行**人物检测与 OCR。若系统已安装 **`ffmpeg`**，脚本会**优先用 ffmpeg 截取**（更稳，尤其可避免 AV1 在 OpenCV 下读帧失败）；否则回退为 OpenCV 逐帧写入。
 
+### 许可与免责
+
+本项目以 **MIT License** 发布（见仓库根目录 [`LICENSE`](LICENSE)）：允许任何人在遵守许可条款的前提下使用、复制、修改与再分发。**作者不对因使用本软件而产生的任何后果承担责任**；使用须自担风险，详见 `LICENSE` 中的英文条款及中文补充说明。
+
 ### 依赖与安装
 
 **跟拍模式**需要安装：
@@ -166,6 +170,10 @@ python video_person_zoom.py 原片_h264.mp4 -n 10 -o /tmp/out.mp4
 
 3. **Trim-only mode (`-n` omitted, but `-w` and `-d` are set)**  
    Exports only that segment **without** detection or OCR. If **`ffmpeg`** is installed, the script **prefers ffmpeg** for trimming; otherwise OpenCV frame-by-frame writing.
+
+### License and disclaimer
+
+This project is released under the **MIT License** (see [`LICENSE`](LICENSE) in the repository root). You may use, copy, modify, and redistribute the software subject to that license. **The authors are not liable for any consequences** arising from use of this software; you use it at your own risk. The English text in `LICENSE` is legally primary; a Chinese summary is included there for convenience.
 
 ### Dependencies
 
