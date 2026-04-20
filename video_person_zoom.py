@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-- 仅 INPUT：URL 则下载到本地，本地路径则复制到当前目录（或 -o），不做转码与跟拍。
-- 提供 -n 球衣号码：检测人物 + OCR 跟拍，可选 -w/-d 截取片段再处理。
-- 不提供 -n 但提供 -w/-d：仅按时间窗口截取片段（不跑检测/OCR，优先 ffmpeg）。
+- INPUT only: download URL or copy local file to cwd (or -o); no transcode or tracking.
+  仅 INPUT：URL 下载到本地，本地路径复制到当前目录（或 -o），不做转码与跟拍。
+- With -n jersey number: detect + OCR tracking; optional -w/-d clip first.
+  提供 -n：检测人物 + OCR 跟拍，可选 -w/-d 先截取片段。
+- Without -n but with -w/-d: time-window trim only (no detect/OCR; prefers ffmpeg).
+  无 -n 但有 -w/-d：仅按时间窗口截取（不跑检测/OCR，优先 ffmpeg）。
 
-用法:
+Usage / 用法:
   video_person_zoom.py INPUT [-o out.mp4]
   video_person_zoom.py INPUT -n 10 [-w TIME -d SEC] [-o out.mp4]
   video_person_zoom.py INPUT -w TIME -d SEC [-o out.mp4]
 
-依赖：跟拍模式需 pip install -r requirements-person-zoom.txt（含 easyocr、ultralytics）
-外部：ffmpeg（yt-dlp 合并音视频时通常需要）。
+Deps / 依赖: tracking needs pip install -r requirements-person-zoom.txt (easyocr, ultralytics).
+外部: ffmpeg (often required for yt-dlp merge).
 """
 
 from __future__ import annotations
@@ -25,19 +28,27 @@ import time
 from pathlib import Path
 
 
+def _b(cn: str, en: str) -> str:
+    """User-facing bilingual text: Chinese / English."""
+
+    return f"{cn} / {en}"
+
+
 def _is_remote(url: str) -> bool:
     u = url.strip().lower()
     return u.startswith("http://") or u.startswith("https://")
 
 
 def _download_video(url: str) -> tuple[str, bool]:
-    """返回 (本地媒体路径, 是否为临时文件需删除)。"""
+    """Return (local path, delete temp dir). / 返回 (本地路径, 是否临时目录需删)。"""
     try:
         import yt_dlp
     except ImportError as e:
         raise SystemExit(
-            "缺少 yt-dlp，请执行: pip install yt-dlp\n"
-            "并确保系统已安装 ffmpeg（用于合并音视频）。"
+            _b(
+                "缺少 yt-dlp，请执行: pip install yt-dlp\n并确保系统已安装 ffmpeg（用于合并音视频）。",
+                "Missing yt-dlp. Run: pip install yt-dlp\nEnsure ffmpeg is installed for merging audio/video.",
+            )
         ) from e
 
     tmpdir = tempfile.mkdtemp(prefix="vpz_")
@@ -58,14 +69,19 @@ def _download_video(url: str) -> tuple[str, bool]:
             return os.path.join(tmpdir, name), True
 
     shutil.rmtree(tmpdir, ignore_errors=True)
-    raise SystemExit("下载完成但未找到输出文件，请检查 URL 或 yt-dlp / ffmpeg 是否可用。")
+    raise SystemExit(
+        _b(
+            "下载完成但未找到输出文件，请检查 URL 或 yt-dlp / ffmpeg 是否可用。",
+            "Download finished but output file not found. Check URL, yt-dlp, and ffmpeg.",
+        )
+    )
 
 
 def _download_or_copy_only(input_raw: str, output_path: str | None) -> str:
     """
-    仅下载（URL）或复制（本地文件）到目标路径。
-    output_path 为 None 时：URL → 当前目录 download_<时间戳>.<扩展名>；本地 → 当前目录 <原名>_copy<后缀>
-    返回最终绝对路径。
+    Download URL or copy local file to destination.
+    仅下载 URL 或复制本地文件到目标路径。
+    If output_path is None: URL → download_<ts>.<ext>; local → <name>_copy<suffix> in cwd.
     """
     tmpdir_to_remove: str | None = None
     try:
@@ -86,7 +102,7 @@ def _download_or_copy_only(input_raw: str, output_path: str | None) -> str:
 
         src = os.path.abspath(input_raw)
         if not os.path.isfile(src):
-            raise SystemExit(f"本地文件不存在: {src}")
+            raise SystemExit(_b(f"本地文件不存在: {src}", f"Local file not found: {src}"))
         if output_path:
             dest = os.path.abspath(output_path)
         else:
@@ -122,7 +138,7 @@ def _iou_xyxy(
 
 
 def _list_person_boxes(result) -> list[tuple[float, float, float, float]]:
-    """当前帧所有人物框 (xyxy)，仅 COCO 类别 person。"""
+    """All person boxes (xyxy, COCO class person) this frame. / 本帧人物框 xyxy。"""
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
         return []
@@ -141,7 +157,7 @@ def _sort_person_boxes(
     boxes: list[tuple[float, float, float, float]],
     order: str,
 ) -> list[tuple[float, float, float, float]]:
-    """按规则排序后返回新列表（不修改入参）。"""
+    """Return sorted copy of boxes. / 按规则排序后的新列表。"""
     if not boxes:
         return []
 
@@ -169,22 +185,22 @@ def _sort_person_boxes(
     elif order == "bottom":
         scored.sort(key=lambda t: (-t[1][1], t[1][0], -t[1][2]))
     else:
-        raise ValueError(f"未知排序规则: {order}")
+        raise ValueError(_b(f"未知排序规则: {order}", f"Unknown sort order: {order}"))
     return [t[0] for t in scored]
 
 
 def _normalize_jersey_target(s: str) -> str:
     t = "".join(c for c in s.strip() if c.isdigit())
     if not t:
-        raise ValueError("球衣号码须为数字")
+        raise ValueError(_b("球衣号码须为数字", "Jersey number must be digits only"))
     return t
 
 
 def _parse_time_to_seconds(s: str) -> float:
-    """支持纯秒数、MM:SS、H:MM:SS（小时可为多位）。"""
+    """Parse seconds, MM:SS, or H:MM:SS. / 解析秒数或 MM:SS / H:MM:SS。"""
     t = s.strip()
     if not t:
-        raise ValueError("时间点不能为空")
+        raise ValueError(_b("时间点不能为空", "Time must not be empty"))
     if ":" not in t:
         return float(t)
     parts = t.split(":")
@@ -194,7 +210,7 @@ def _parse_time_to_seconds(s: str) -> float:
     if len(parts) == 3:
         h, m, sec = parts
         return int(h, 10) * 3600 + int(m, 10) * 60 + float(sec)
-    raise ValueError(f"无法解析时间点: {s!r}")
+    raise ValueError(_b(f"无法解析时间点: {s!r}", f"Cannot parse time: {s!r}"))
 
 
 def _clip_window_seconds(
@@ -203,13 +219,13 @@ def _clip_window_seconds(
     duration_sec: float,
 ) -> tuple[float, float]:
     """
-    以 center_sec 为中心、总长 duration_sec 的窗口，夹在 [0, video_len_sec] 内。
-    若视频短于 duration，则返回整段 [0, video_len_sec]。
+    Clip window [start,end] centered at center_sec, length duration_sec, clamped to video.
+    以 center 为中心、总长 duration 的窗口，夹在片长内。
     """
     if video_len_sec <= 0:
         return 0.0, max(0.0, duration_sec)
     if duration_sec <= 0:
-        raise ValueError("时长必须大于 0")
+        raise ValueError(_b("时长必须大于 0", "Duration must be greater than 0"))
     if duration_sec >= video_len_sec:
         return 0.0, video_len_sec
     half = duration_sec / 2.0
@@ -235,11 +251,12 @@ def _ffmpeg_extract_segment(
     duration_sec: float,
 ) -> None:
     """
-    用 ffmpeg 按时间截取并输出 H.264 + AAC 的 MP4，避免 OpenCV 解码 AV1 等格式失败导致空文件。
+    Trim with ffmpeg to H.264+AAC MP4 (avoids OpenCV AV1 issues).
+    用 ffmpeg 截取为 H.264 MP4，减轻 OpenCV 解 AV1 失败。
     """
     ff = _ffmpeg_bin()
     if not ff:
-        raise RuntimeError("未找到 ffmpeg")
+        raise RuntimeError(_b("未找到 ffmpeg", "ffmpeg not found in PATH"))
 
     base = [
         ff,
@@ -271,8 +288,12 @@ def _ffmpeg_extract_segment(
         r2 = subprocess.run(cmd_an, capture_output=True, text=True)
         if r2.returncode != 0:
             raise SystemExit(
-                "ffmpeg 截取失败（含无音轨重试）。stderr:\n"
-                f"{r.stderr or r.stdout}\n---\n{r2.stderr or r2.stdout}"
+                _b(
+                    "ffmpeg 截取失败（含无音轨重试）。stderr:\n"
+                    f"{r.stderr or r.stdout}\n---\n{r2.stderr or r2.stdout}",
+                    "ffmpeg trim failed (including no-audio retry). stderr:\n"
+                    f"{r.stderr or r.stdout}\n---\n{r2.stderr or r2.stdout}",
+                )
             )
 
 
@@ -282,7 +303,7 @@ def _clip_segment_start_and_duration(
     center_sec: float,
     clip_duration_sec: float,
 ) -> tuple[float, float]:
-    """返回 (起点秒, 片段长度秒)，与 _clip_seek_cap 使用的窗口一致。"""
+    """(start_sec, length_sec) same window as _clip_seek_cap. / 起点与长度秒。"""
     d = float(clip_duration_sec)
     c = float(center_sec)
     if nframes > 0 and fps > 0:
@@ -295,16 +316,21 @@ def _clip_segment_start_and_duration(
 
 
 def _ensure_capture_readable(cap: object, input_path: str) -> None:
-    """读取首帧；失败时提示 AV1 等格式需先转码。"""
+    """Read first frame or exit with transcode hint. / 读首帧，失败则提示转码。"""
     import cv2
 
     ok, frame = cap.read()
     if not ok or frame is None:
         cap.release()
         raise SystemExit(
-            "无法从视频解码出第一帧。若片源为 AV1 或本机无硬解，OpenCV 可能读不到画面。\n"
-            "请先转码为 H.264 再处理，例如：\n"
-            f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\""
+            _b(
+                "无法从视频解码出第一帧。若片源为 AV1 或本机无硬解，OpenCV 可能读不到画面。\n"
+                "请先转码为 H.264 再处理，例如：\n"
+                f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
+                "Cannot decode the first frame (AV1 or no HW decode may fail in OpenCV).\n"
+                "Transcode to H.264 first, e.g.:\n"
+                f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
+            )
         )
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
 
@@ -320,8 +346,12 @@ def _assert_output_not_empty(path: str, frames_written: int) -> None:
         except OSError:
             pass
         raise SystemExit(
-            "输出视频几乎为空或无法写入有效帧（常见原因：输入为 AV1 且 OpenCV 未读到任何帧，"
-            "或编码器不可用）。请先转 H.264 再运行，或安装 ffmpeg 后使用仅截取模式（将优先走 ffmpeg）。"
+            _b(
+                "输出视频几乎为空或无法写入有效帧（常见原因：输入为 AV1 且 OpenCV 未读到任何帧，"
+                "或编码器不可用）。请先转 H.264 再运行，或安装 ffmpeg 后使用仅截取模式（将优先走 ffmpeg）。",
+                "Output is nearly empty or no valid frames (e.g. AV1 not decoded by OpenCV, or encoder issue). "
+                "Transcode to H.264 first, or install ffmpeg and use trim-only mode (prefers ffmpeg).",
+            )
         )
 
 
@@ -333,8 +363,8 @@ def _clip_seek_cap(
     clip_duration_sec: float,
 ) -> tuple[int, float, float]:
     """
-    将 VideoCapture 定位到以 center_sec 为中心、总长 clip_duration_sec 的窗口起点。
-    返回 (输出帧数, 窗口起点秒, 窗口终点秒)。
+    Seek capture to clip start; return (frame_count, start_sec, end_sec).
+    定位到片段起点；返回 (帧数, 起点秒, 终点秒)。
     """
     import cv2
 
@@ -365,12 +395,12 @@ def process_clip_only(
     center_sec: float,
     duration_sec: float,
 ) -> None:
-    """仅截取 [-w,-d] 时间窗口。若系统有 ffmpeg，优先用其截取（兼容 AV1，避免 OpenCV 解码失败）。"""
+    """Trim [-w,-d] window; prefers ffmpeg. / 仅截取时间窗，优先 ffmpeg。"""
     import cv2
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        raise SystemExit(f"无法打开视频: {input_path}")
+        raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -382,20 +412,28 @@ def process_clip_only(
     )
     end_sec_print = start_sec + seg_dur
     print(
-        f"仅截取片段: 约 {start_sec:.3f}s – {end_sec_print:.3f}s，"
-        f"长 {seg_dur:.3f}s。",
+        _b(
+            f"仅截取片段: 约 {start_sec:.3f}s – {end_sec_print:.3f}s，长 {seg_dur:.3f}s。",
+            f"Trim clip: ~{start_sec:.3f}s – {end_sec_print:.3f}s, length {seg_dur:.3f}s.",
+        ),
         file=sys.stderr,
     )
 
     if _ffmpeg_bin():
-        print("使用 ffmpeg 截取（推荐，可避免 AV1 等在 OpenCV 下无法解码的问题）。", file=sys.stderr)
+        print(
+            _b(
+                "使用 ffmpeg 截取（推荐，可避免 AV1 等在 OpenCV 下无法解码的问题）。",
+                "Using ffmpeg to trim (recommended; avoids AV1 decode issues in OpenCV).",
+            ),
+            file=sys.stderr,
+        )
         cap.release()
         try:
             _ffmpeg_extract_segment(input_path, output_path, start_sec, seg_dur)
         except SystemExit:
             raise
         except Exception as e:
-            raise SystemExit(f"ffmpeg 截取失败: {e}") from e
+            raise SystemExit(_b(f"ffmpeg 截取失败: {e}", f"ffmpeg trim failed: {e}")) from e
         try:
             sz = os.path.getsize(output_path)
         except OSError:
@@ -406,15 +444,24 @@ def process_clip_only(
             except OSError:
                 pass
             raise SystemExit(
-                "ffmpeg 输出过小，可能时间段超出片长或输入损坏。请检查 -w/-d 与片源。"
+                _b(
+                    "ffmpeg 输出过小，可能时间段超出片长或输入损坏。请检查 -w/-d 与片源。",
+                    "ffmpeg output too small; clip may exceed duration or input is bad. Check -w/-d and source.",
+                )
             )
-        print(f"已写入: {output_path}（{sz} 字节）", file=sys.stderr)
+        print(
+            _b(
+                f"已写入: {output_path}（{sz} 字节）",
+                f"Written: {output_path} ({sz} bytes)",
+            ),
+            file=sys.stderr,
+        )
         return
 
     cap.release()
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        raise SystemExit(f"无法重新打开视频: {input_path}")
+        raise SystemExit(_b(f"无法重新打开视频: {input_path}", f"Cannot reopen video: {input_path}"))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -424,8 +471,12 @@ def process_clip_only(
         cap, fps, nframes, center_sec, duration_sec
     )
     print(
-        f"回退 OpenCV 逐帧写入: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
-        f"共 {clip_frames_total} 帧（未安装 ffmpeg 时可用性较差）。",
+        _b(
+            f"回退 OpenCV 逐帧写入: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
+            f"共 {clip_frames_total} 帧（未安装 ffmpeg 时可用性较差）。",
+            f"Fallback OpenCV frame write: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
+            f"{clip_frames_total} frames (less reliable without ffmpeg).",
+        ),
         file=sys.stderr,
     )
 
@@ -434,7 +485,7 @@ def process_clip_only(
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
         cap.release()
-        raise SystemExit(f"无法创建输出文件: {output_path}")
+        raise SystemExit(_b(f"无法创建输出文件: {output_path}", f"Cannot create output: {output_path}"))
 
     frames_out = 0
     try:
@@ -450,7 +501,7 @@ def process_clip_only(
             if clip_frames_total and frames_out % max(1, clip_frames_total // 20) == 0:
                 pct = 100.0 * frames_out / clip_frames_total
                 print(
-                    f"\r进度: {frames_out}/{clip_frames_total} ({pct:.0f}%)",
+                    f"\r{_b('进度', 'Progress')}: {frames_out}/{clip_frames_total} ({pct:.0f}%)",
                     end="",
                     file=sys.stderr,
                 )
@@ -466,7 +517,7 @@ def _jersey_roi_xyxy(
     frame_shape: tuple[int, ...],
     xyxy: tuple[float, float, float, float],
 ) -> tuple[int, int, int, int] | None:
-    """人体框内偏上区域（胸口号码常见位置），返回整数 xyxy。"""
+    """Upper-torso ROI for jersey OCR; integer xyxy. / 胸口附近 ROI。"""
     fh, fw = int(frame_shape[0]), int(frame_shape[1])
     x1, y1, x2, y2 = xyxy
     pw = max(1.0, x2 - x1)
@@ -481,7 +532,7 @@ def _jersey_roi_xyxy(
 
 
 def _ocr_text_matches_target(texts: list[str], target: str) -> bool:
-    """合并各段数字后是否与目标完全一致（避免子串误匹配）。"""
+    """Whether OCR digit runs match target exactly. / 数字串是否与目标一致。"""
     segs: list[str] = []
     for raw in texts:
         segs.append("".join(c for c in raw if c.isdigit()))
@@ -544,7 +595,7 @@ def _find_box_by_jersey_scan(
     target: str,
     min_conf: float,
 ) -> tuple[float, float, float, float] | None:
-    """按人体框从大到小依次 OCR，返回首个匹配号码的框。"""
+    """OCR largest persons first; first matching box. / 从大到小 OCR，首匹配框。"""
     ranked = _sort_person_boxes(persons, "area-desc")
     for b in ranked:
         if _ocr_jersey_match(reader, frame_bgr, b, target, min_conf):
@@ -560,7 +611,7 @@ def _relock_by_jersey(
     target: str,
     min_conf: float,
 ) -> tuple[float, float, float, float] | None:
-    """跟丢时优先尝试与上一框 IoU 较大的人体上的 OCR。"""
+    """On drift, prefer high-IoU persons for OCR. / 跟丢时优先高 IoU 人体 OCR。"""
     order = sorted(
         range(len(persons)),
         key=lambda j: _iou(prev_xyxy, persons[j]),
@@ -586,7 +637,7 @@ def _expand_and_clip_box(
     cy = (y1 + y2) / 2.0
     bw = (x2 - x1) * (1.0 + pad)
     bh = (y2 - y1) * (1.0 + pad)
-    # 保持与画面相同宽高比，避免拉伸人物
+    # Match frame aspect ratio / 与画面同宽高比，避免拉伸人物
     ar_frame = w / max(h, 1)
     ar_box = bw / max(bh, 1e-6)
     if ar_box > ar_frame:
@@ -654,7 +705,10 @@ def process_video(
         from ultralytics import YOLO
     except ImportError as e:
         raise SystemExit(
-            "缺少依赖，请执行: pip install -r requirements-person-zoom.txt"
+            _b(
+                "缺少依赖，请执行: pip install -r requirements-person-zoom.txt",
+                "Missing dependencies. Run: pip install -r requirements-person-zoom.txt",
+            )
         ) from e
 
     use_cuda = bool(device and device.startswith("cuda"))
@@ -670,9 +724,9 @@ def process_video(
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        raise SystemExit(f"无法打开视频: {input_path}")
+        raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
 
-    _ensure_readable(cap, input_path)
+    _ensure_capture_readable(cap, input_path)
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -685,19 +739,28 @@ def process_video(
             cap, fps, nframes, float(clip_center_sec), float(clip_duration_sec)
         )
         print(
-            f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
-            f"共 {clip_frames_total} 帧（-w 中心 -d 总长）。",
+            _b(
+                f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
+                f"共 {clip_frames_total} 帧（-w 中心 -d 总长）。",
+                f"Output clip: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
+                f"{clip_frames_total} frames (-w center, -d duration).",
+            ),
             file=sys.stderr,
         )
     elif clip_center_sec is not None or clip_duration_sec is not None:
-        raise SystemExit("请同时提供 -w 与 -d，或两者都不提供以处理整段视频。")
+        raise SystemExit(
+            _b(
+                "请同时提供 -w 与 -d，或两者都不提供以处理整段视频。",
+                "Provide both -w and -d together, or neither for full video.",
+            )
+        )
 
     out_w, out_h = w - (w % 2), h - (h % 2)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
         cap.release()
-        raise SystemExit(f"无法创建输出文件: {output_path}")
+        raise SystemExit(_b(f"无法创建输出文件: {output_path}", f"Cannot create output: {output_path}"))
 
     model = YOLO(model_name)
     if device:
@@ -716,7 +779,7 @@ def process_video(
     progress_total = clip_frames_total if clip_frames_total is not None else nframes
 
     def _write_full_and_maybe_abort() -> None:
-        """未锁定前输出全画面；超过搜索上限则退出。"""
+        """Full frame until lock or search limit. / 锁定前全画面或超帧退出。"""
         nonlocal frames_out, total_written
         out = cv2.resize(frame, (out_w, out_h))
         writer.write(out)
@@ -725,7 +788,10 @@ def process_video(
             frames_out += 1
         if frame_i == 1:
             print(
-                "正在扫描球衣号码：输出暂为全画面，直至首次识别成功。",
+                _b(
+                    "正在扫描球衣号码：输出暂为全画面，直至首次识别成功。",
+                    "Scanning jersey number: full frame until first successful read.",
+                ),
                 file=sys.stderr,
             )
         if (
@@ -734,8 +800,12 @@ def process_video(
             and frame_i >= max_jersey_search_frames
         ):
             raise SystemExit(
-                f"前 {max_jersey_search_frames} 帧内未识别到球衣 {jersey}。"
-                "可提高 --max-search-frames、换更清晰片段，或略调 --ocr-min-conf。"
+                _b(
+                    f"前 {max_jersey_search_frames} 帧内未识别到球衣 {jersey}。"
+                    "可提高 --max-search-frames、换更清晰片段，或略调 --ocr-min-conf。",
+                    f"No jersey {jersey} found in the first {max_jersey_search_frames} frames. "
+                    "Try --max-search-frames, a clearer clip, or --ocr-min-conf.",
+                )
             )
 
     try:
@@ -780,7 +850,10 @@ def process_video(
                             box = ocr_hit
                             if not warned_jersey_relock:
                                 print(
-                                    f"注意: IoU 过低({best_iou:.2f})，已用球衣号码 {jersey} 重新锁定。",
+                                    _b(
+                                        f"注意: IoU 过低({best_iou:.2f})，已用球衣号码 {jersey} 重新锁定。",
+                                        f"Note: low IoU ({best_iou:.2f}); re-locked by jersey {jersey} via OCR.",
+                                    ),
                                     file=sys.stderr,
                                 )
                                 warned_jersey_relock = True
@@ -788,7 +861,10 @@ def process_video(
                             box = last_box
                             if not warned_relock:
                                 print(
-                                    f"注意: IoU 低且未 OCR 到 {jersey}，暂沿用上一帧位置。",
+                                    _b(
+                                        f"注意: IoU 低且未 OCR 到 {jersey}，暂沿用上一帧位置。",
+                                        f"Note: low IoU and OCR missed {jersey}; holding last frame position.",
+                                    ),
                                     file=sys.stderr,
                                 )
                                 warned_relock = True
@@ -806,7 +882,10 @@ def process_video(
                     box = jb
                     if not lock_announced:
                         print(
-                            f"已锁定球衣号码 {jersey}（第 {frame_i} 帧）。",
+                            _b(
+                                f"已锁定球衣号码 {jersey}（第 {frame_i} 帧）。",
+                                f"Locked jersey {jersey} (frame {frame_i}).",
+                            ),
                             file=sys.stderr,
                         )
                         lock_announced = True
@@ -842,14 +921,14 @@ def process_video(
                 if clip_frames_total and frames_out % max(1, clip_frames_total // 20) == 0:
                     pct = 100.0 * frames_out / clip_frames_total
                     print(
-                        f"\r进度: {frames_out}/{clip_frames_total} ({pct:.0f}%)",
+                        f"\r{_b('进度', 'Progress')}: {frames_out}/{clip_frames_total} ({pct:.0f}%)",
                         end="",
                         file=sys.stderr,
                     )
             elif progress_total and frame_i % max(1, progress_total // 20) == 0:
                 pct = 100.0 * frame_i / progress_total
                 print(
-                    f"\r进度: {frame_i}/{progress_total} ({pct:.0f}%)",
+                    f"\r{_b('进度', 'Progress')}: {frame_i}/{progress_total} ({pct:.0f}%)",
                     end="",
                     file=sys.stderr,
                 )
@@ -862,17 +941,26 @@ def process_video(
 
     if last_box is None:
         raise SystemExit(
-            f"整段视频未成功锁定球衣号码 {jersey}（需在某一帧同时检出人物并 OCR 到该号码）。"
+            _b(
+                f"整段视频未成功锁定球衣号码 {jersey}（需在某一帧同时检出人物并 OCR 到该号码）。",
+                f"Could not lock jersey {jersey}: need at least one frame with a person and readable number.",
+            )
         )
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="仅 INPUT：下载或复制；或 -n 跟拍；或无 -n 时用 -w/-d 截取片段。"
+        description=_b(
+            "仅 INPUT：下载或复制；或 -n 跟拍；或无 -n 时用 -w/-d 截取片段。",
+            "INPUT only: download/copy; or -n tracking; or -w/-d trim without -n.",
+        )
     )
     p.add_argument(
         "input",
-        help="本地视频路径，或 http(s) 媒体地址（由 yt-dlp 下载，常见为 YouTube 链接）",
+        help=_b(
+            "本地视频路径，或 http(s) URL（yt-dlp 下载，如 YouTube）",
+            "Local video path or http(s) URL (downloaded via yt-dlp, e.g. YouTube)",
+        ),
     )
     p.add_argument(
         "-n",
@@ -880,35 +968,53 @@ def main() -> None:
         dest="jersey_number",
         default=None,
         metavar="NUM",
-        help="要跟拍的球衣号码（仅数字）。不提供且不提供 -w/-d 时：仅下载 URL 或复制本地文件",
+        help=_b(
+            "要跟拍的球衣号码（仅数字）。无 -n 且无 -w/-d：仅下载或复制",
+            "Jersey number (digits). Without -n and without -w/-d: download or copy only",
+        ),
     )
     p.add_argument(
         "-o",
         "--output",
         default="",
-        help="输出 mp4 路径；默认写入当前目录下的自动命名文件",
+        help=_b(
+            "输出 MP4 路径；默认当前目录自动命名",
+            "Output MP4 path; default auto name in current directory",
+        ),
     )
     p.add_argument(
         "--model",
         default="yolov8n.pt",
-        help="Ultralytics 模型名或权重路径，默认 yolov8n.pt（首次会自动下载）",
+        help=_b(
+            "Ultralytics 模型名或权重路径，默认 yolov8n.pt（首次可自动下载）",
+            "Ultralytics model name or weights path; default yolov8n.pt (may auto-download)",
+        ),
     )
     p.add_argument(
         "--padding",
         type=float,
         default=0.25,
-        help="在人物框外额外留白比例（相对宽高），默认 0.25",
+        help=_b(
+            "人物框外留白比例（相对宽高），默认 0.25",
+            "Extra margin around person box; default 0.25",
+        ),
     )
     p.add_argument(
         "--smooth",
         type=float,
         default=0.35,
-        help="框位置平滑系数 0~1，越大越贴近当前检测、抖动越大，默认 0.35",
+        help=_b(
+            "框平滑系数 0~1，越大越贴近当前检测、可能更抖，默认 0.35",
+            "Box smoothing 0–1; higher follows detection more closely; default 0.35",
+        ),
     )
     p.add_argument(
         "--device",
         default="",
-        help="推理设备，例如 cpu、cuda:0；留空则由 Ultralytics 自行选择",
+        help=_b(
+            "推理设备，如 cpu、cuda:0；留空由 Ultralytics 选择",
+            "Inference device, e.g. cpu, cuda:0; empty lets Ultralytics choose",
+        ),
     )
     p.add_argument(
         "--target-order",
@@ -921,31 +1027,46 @@ def main() -> None:
             "top",
             "bottom",
         ),
-        help="多人时按何种顺序编号再取 --target-index：面积从大到小/从小到大，或按画面左/右/上/下位置",
+        help=_b(
+            "多人时排序再取 --target-index：面积或左/右/上/下",
+            "When multiple people: sort order before --target-index",
+        ),
     )
     p.add_argument(
         "--target-index",
         type=int,
         default=0,
-        help="在 --target-order 排序下的 0 起始下标，例如 left 且 1 表示「从左数第二个人」",
+        help=_b(
+            "--target-order 下的 0 起始下标（如 left 且 1 为左起第二人）",
+            "0-based index after --target-order (e.g. left + 1 = second from left)",
+        ),
     )
     p.add_argument(
         "--min-iou",
         type=float,
         default=0.2,
-        help="帧间与上一帧检测框 IoU 低于该值时尝试 OCR 重锁，默认 0.2",
+        help=_b(
+            "帧间 IoU 低于该值时尝试 OCR 重锁，默认 0.2",
+            "If IoU vs previous box is below this, try OCR re-lock; default 0.2",
+        ),
     )
     p.add_argument(
         "--ocr-min-conf",
         type=float,
         default=0.15,
-        help="EasyOCR 单段文字置信度下限，识别困难时可降到 0.08~0.12，默认 0.15",
+        help=_b(
+            "EasyOCR 置信度下限，困难时可降到 0.08~0.12，默认 0.15",
+            "EasyOCR min confidence; try 0.08–0.12 if hard; default 0.15",
+        ),
     )
     p.add_argument(
         "--max-search-frames",
         type=int,
         default=2400,
-        help="从片头起最多扫描多少帧以寻找目标号码；0 表示不限制。默认 2400",
+        help=_b(
+            "从处理起点起最多多少帧内须首次识别号码；0 不限制；默认 2400",
+            "Max frames from start to first successful number read; 0 = unlimited; default 2400",
+        ),
     )
     p.add_argument(
         "-w",
@@ -953,23 +1074,34 @@ def main() -> None:
         type=str,
         default=None,
         metavar="TIME",
-        help="输出片段的中心时间点（秒或 MM:SS / H:MM:SS）；必须与 -d 一起使用",
+        help=_b(
+            "片段中心时间（秒或 MM:SS / H:MM:SS）；须与 -d 同用",
+            "Clip center time; use with -d",
+        ),
     )
     p.add_argument(
         "-d",
         "--duration",
         type=float,
         default=None,
-        help="输出片段总时长（秒），以 -w 为中心向两侧对称截取；必须与 -w 一起使用",
+        help=_b(
+            "片段总时长（秒），以 -w 为中心对称截取；须与 -w 同用",
+            "Clip length in seconds, symmetric around -w; use with -w",
+        ),
     )
     args = p.parse_args()
 
     if (args.window is None) != (args.duration is None):
-        p.error("请同时提供 -w 与 -d，或两者都不提供。")
+        p.error(
+            _b(
+                "请同时提供 -w 与 -d，或两者都不提供。",
+                "Provide both -w and -d, or neither.",
+            )
+        )
 
     raw = args.input.strip()
     if not raw:
-        p.error("请提供输入路径或 URL")
+        p.error(_b("请提供输入路径或 URL", "Provide input path or URL"))
 
     has_jersey = bool(args.jersey_number and str(args.jersey_number).strip())
     has_clip = args.window is not None
@@ -988,7 +1120,7 @@ def main() -> None:
                 p.error(str(e))
             clip_duration_sec = float(args.duration)
             if clip_duration_sec <= 0:
-                p.error("-d 时长必须大于 0")
+                p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
     elif has_clip:
         try:
             clip_only_center = _parse_time_to_seconds(args.window)
@@ -996,7 +1128,7 @@ def main() -> None:
             p.error(str(e))
         clip_only_duration = float(args.duration)
         if clip_only_duration <= 0:
-            p.error("-d 时长必须大于 0")
+            p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
     else:
         out_opt = args.output.strip() if args.output else None
         final_path = _download_or_copy_only(raw, out_opt)
@@ -1023,7 +1155,7 @@ def main() -> None:
     else:
         local_path = os.path.abspath(raw)
         if not os.path.isfile(local_path):
-            p.error(f"本地文件不存在: {local_path}")
+            p.error(_b(f"本地文件不存在: {local_path}", f"Local file not found: {local_path}"))
         if args.output:
             out_path = os.path.abspath(args.output)
         elif clip_trim:
@@ -1052,7 +1184,7 @@ def main() -> None:
         else:
             msearch = args.max_search_frames
             if msearch < 0:
-                p.error("--max-search-frames 不能为负数")
+                p.error(_b("--max-search-frames 不能为负数", "--max-search-frames must be non-negative"))
             process_video(
                 local_path,
                 out_path,
