@@ -1,0 +1,22 @@
+# virtual environments
+myvenv/
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Ultralytics / local weights (script can re-download yolov8n.pt)
+*.pt
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
