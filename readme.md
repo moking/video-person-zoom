@@ -1,9 +1,42 @@
 # video_person_zoom.py — 使用说明 / User Guide
 
+**Contents / 目录**
+
+- [中文](#section-cn)
+  - [概述](#cn-overview)
+  - [许可与免责](#cn-license)
+  - [依赖与安装](#cn-deps)
+  - [基本用法](#cn-basic)
+  - [三种模式对照](#cn-modes)
+  - [常用参数说明](#cn-options)
+  - [默认输出文件名](#cn-default-out)
+  - [示例](#cn-examples)
+  - [故障排除（AV1、极小 MP4）](#cn-troubleshoot)
+    - [原因说明](#cn-troubleshoot-cause)
+    - [脚本行为](#cn-troubleshoot-behavior)
+    - [处理建议](#cn-troubleshoot-fix)
+  - [已知限制](#cn-limits)
+- [English](#section-en)
+  - [Overview](#en-overview)
+  - [License and disclaimer](#en-license)
+  - [Dependencies](#en-deps)
+  - [Basic invocation](#en-basic)
+  - [Mode summary](#en-modes)
+  - [Common options](#en-options)
+  - [Default output filenames](#en-default-out)
+  - [Examples](#en-examples)
+  - [Troubleshooting (AV1, tiny MP4)](#en-troubleshoot)
+    - [What is going on](#en-troubleshoot-cause)
+    - [Behavior in the script](#en-troubleshoot-behavior)
+    - [What you should do](#en-troubleshoot-fix)
+  - [Limitations](#en-limits)
+
 ---
 
+<a id="section-cn"></a>
 ## 中文
 
+<a id="cn-overview"></a>
 ### 概述
 
 `video_person_zoom.py` 支持三种工作方式：
@@ -19,10 +52,12 @@
 3. **仅截取模式（不提供 `-n`，但提供 `-w` 与 `-d`）**  
    只按时间窗口从原片截取片段输出，**不进行**人物检测与 OCR。若系统已安装 **`ffmpeg`**，脚本会**优先用 ffmpeg 截取**（更稳，尤其可避免 AV1 在 OpenCV 下读帧失败）；否则回退为 OpenCV 逐帧写入。
 
+<a id="cn-license"></a>
 ### 许可与免责
 
 本项目以 **MIT License** 发布（见仓库根目录 [`LICENSE`](LICENSE)）：允许任何人在遵守许可条款的前提下使用、复制、修改与再分发。**作者不对因使用本软件而产生的任何后果承担责任**；使用须自担风险，详见 `LICENSE` 中的英文条款及中文补充说明。
 
+<a id="cn-deps"></a>
 ### 依赖与安装
 
 **跟拍模式**需要安装：
@@ -41,6 +76,7 @@ sudo apt update && sudo apt install -y ffmpeg
 
 **仅截取模式**：**强烈建议**安装系统 **`ffmpeg`**（脚本优先用它截取）；否则仅用 OpenCV 写 MP4，对部分编码（如 AV1）兼容性较差。若输入为 URL，仍需要 `yt-dlp` 与 `ffmpeg`。
 
+<a id="cn-basic"></a>
 ### 基本用法
 
 ```text
@@ -49,6 +85,7 @@ video_person_zoom.py INPUT [选项]
 
 - **`INPUT`**：本地视频路径，或 `http(s)` 地址（由 `yt-dlp` 下载，常见于 YouTube）。
 
+<a id="cn-modes"></a>
 ### 三种模式对照
 
 | 模式           | 条件 | 行为说明 |
@@ -63,6 +100,7 @@ video_person_zoom.py INPUT [选项]
 - **`-w TIME`**：片段中心时间，支持秒数（如 `90`、`90.5`）、`MM:SS`、`H:MM:SS`。
 - **`-d SECONDS`**：片段总时长（秒），以 `-w` 为中心向两侧对称截取；靠近片头/片尾时窗口会在 `[0, 片长]` 内平移，总长仍为 `d`（片长不足 `d` 时导出整段）。
 
+<a id="cn-options"></a>
 ### 常用参数说明（中文）
 
 | 参数 | 说明 |
@@ -81,6 +119,7 @@ video_person_zoom.py INPUT [选项]
 | `--ocr-min-conf` | EasyOCR 置信度下限，默认 `0.15`。 |
 | `--max-search-frames` | 从处理起点起最多多少帧内必须首次识别到号码；`0` 表示不限制；默认 `2400`。 |
 
+<a id="cn-default-out"></a>
 ### 默认输出文件名（中文）
 
 | 输入 | 模式 | 默认输出 |
@@ -92,6 +131,7 @@ video_person_zoom.py INPUT [选项]
 | URL | 跟拍 | `jersey{号码}_zoom_<时间戳>.mp4` |
 | URL | 仅截取 | `clip_<时间戳>.mp4` |
 
+<a id="cn-examples"></a>
 ### 示例（中文）
 
 ```bash
@@ -114,8 +154,10 @@ python video_person_zoom.py match.mp4 -w 5:00 -d 20 -o clip.mp4
 python video_person_zoom.py "https://www.youtube.com/watch?v=VIDEO_ID" -n 7 -w 1:30 -d 15 -o ./out.mp4
 ```
 
+<a id="cn-troubleshoot"></a>
 ### 故障排除：AV1 提示、输出 MP4 极小且无法播放
 
+<a id="cn-troubleshoot-cause"></a>
 #### 原因说明
 
 1. **`Your platform doesn't support hardware accelerated AV1 decoding`**  
@@ -124,12 +166,14 @@ python video_person_zoom.py "https://www.youtube.com/watch?v=VIDEO_ID" -n 7 -w 1
 2. **生成的文件（例如 `/tmp/abc.mp4`）体积极小、播放器打不开**  
    常见原因是：**几乎没有成功解码并写出有效帧**。旧逻辑主要依赖 OpenCV `VideoCapture` 逐帧读取；对 **AV1** 等格式，在不少环境下 `read()` 会**很快失败或几乎读不到帧**，`VideoWriter` 只会留下一个**近乎空的、损坏的 MP4**（常见只有几 KB～几十 KB）。
 
+<a id="cn-troubleshoot-behavior"></a>
 #### 脚本中的相关行为（便于对照现象）
 
 - **仅截取模式（无 `-n`）**：若检测到系统 **`ffmpeg`**，会**优先用 ffmpeg** 按 `-w`/`-d` 截取并输出 **H.264**（必要时无音轨重试），**不依赖 OpenCV 解码片源**，一般可避免 AV1 导致的空文件。  
 - **跟拍模式（有 `-n`）**：打开视频后会**先试读第一帧**；读不到会提示先把片源转成 **H.264** 再处理。  
 - **两种模式**：写入结束后会检查 **写入帧数** 与 **输出文件大小**；明显异常时会报错并尝试删除无效输出，避免误以为已成功生成。
 
+<a id="cn-troubleshoot-fix"></a>
 #### 你可以怎么做
 
 **若主要是截取片段（不提供 `-n`）：**  
@@ -146,6 +190,7 @@ python video_person_zoom.py 原片_h264.mp4 -n 10 -o /tmp/out.mp4
 **其它检查：**  
 若仍异常，请确认 **`-w` / `-d` 未超出片长**，片源文件未损坏；并查看终端完整报错信息。
 
+<a id="cn-limits"></a>
 ### 已知限制（中文）
 
 - OCR 依赖画面清晰度；远景、模糊、遮挡可能导致无法锁定或跟错。  
@@ -154,8 +199,10 @@ python video_person_zoom.py 原片_h264.mp4 -n 10 -o /tmp/out.mp4
 
 ---
 
+<a id="section-en"></a>
 ## English
 
+<a id="en-overview"></a>
 ### Overview
 
 `video_person_zoom.py` supports three modes:
@@ -171,10 +218,12 @@ python video_person_zoom.py 原片_h264.mp4 -n 10 -o /tmp/out.mp4
 3. **Trim-only mode (`-n` omitted, but `-w` and `-d` are set)**  
    Exports only that segment **without** detection or OCR. If **`ffmpeg`** is installed, the script **prefers ffmpeg** for trimming; otherwise OpenCV frame-by-frame writing.
 
+<a id="en-license"></a>
 ### License and disclaimer
 
 This project is released under the **MIT License** (see [`LICENSE`](LICENSE) in the repository root). You may use, copy, modify, and redistribute the software subject to that license. **The authors are not liable for any consequences** arising from use of this software; you use it at your own risk. The English text in `LICENSE` is legally primary; a Chinese summary is included there for convenience.
 
+<a id="en-deps"></a>
 ### Dependencies
 
 **Tracking mode:**
@@ -189,6 +238,7 @@ For **HTTP(S) sources** (e.g. YouTube), **`ffmpeg`** must be installed on the sy
 
 **Trim-only mode**: **`ffmpeg` is strongly recommended** (the script prefers it for trimming). Without it, OpenCV-only MP4 writing can be unreliable for some codecs (e.g. AV1). URLs still need `yt-dlp` and `ffmpeg`.
 
+<a id="en-basic"></a>
 ### Basic invocation
 
 ```text
@@ -197,6 +247,7 @@ video_person_zoom.py INPUT [options]
 
 - **`INPUT`**: path to a local video file, or an `http(s)` URL (downloaded via `yt-dlp`).
 
+<a id="en-modes"></a>
 ### Mode summary
 
 | Mode | Condition | Behavior |
@@ -211,6 +262,7 @@ video_person_zoom.py INPUT [options]
 - **`-w TIME`**: center time of the clip; supports seconds (`90`, `90.5`), `MM:SS`, or `H:MM:SS`.
 - **`-d SECONDS`**: total clip length in seconds, symmetric around `-w`; the window is clamped/shifted to stay inside `[0, duration]` while keeping length `d` when possible (if the file is shorter than `d`, the whole file is exported).
 
+<a id="en-options"></a>
 ### Common options (English)
 
 | Option | Description |
@@ -229,6 +281,7 @@ video_person_zoom.py INPUT [options]
 | `--ocr-min-conf` | EasyOCR confidence threshold; default `0.15`. |
 | `--max-search-frames` | Max frames from the processing start to obtain the first successful number read; `0` = unlimited; default `2400`. |
 
+<a id="en-default-out"></a>
 ### Default output filenames (English)
 
 | Input | Mode | Default output |
@@ -240,6 +293,7 @@ video_person_zoom.py INPUT [options]
 | URL | Tracking | `jersey{NUM}_zoom_<unix_timestamp>.mp4` |
 | URL | Trim-only | `clip_<unix_timestamp>.mp4` |
 
+<a id="en-examples"></a>
 ### Examples (English)
 
 ```bash
@@ -262,8 +316,10 @@ python video_person_zoom.py match.mp4 -w 5:00 -d 20 -o clip.mp4
 python video_person_zoom.py "https://www.youtube.com/watch?v=VIDEO_ID" -n 7 -w 1:30 -d 15 -o ./out.mp4
 ```
 
+<a id="en-troubleshoot"></a>
 ### Troubleshooting: AV1 message, tiny or unplayable MP4
 
+<a id="en-troubleshoot-cause"></a>
 #### What is going on
 
 1. **`Your platform doesn't support hardware accelerated AV1 decoding`**  
@@ -272,12 +328,14 @@ python video_person_zoom.py "https://www.youtube.com/watch?v=VIDEO_ID" -n 7 -w 1
 2. **Output file (e.g. `/tmp/abc.mp4`) is extremely small and won’t play**  
    Typical cause: **almost no frames were successfully decoded and written**. When the pipeline relied mainly on OpenCV `VideoCapture`, some **AV1** sources cause `read()` to **fail quickly or return almost no frames**, leaving a **near-empty, broken MP4** (often only a few KB to a few tens of KB).
 
+<a id="en-troubleshoot-behavior"></a>
 #### Behavior in the script (what changed, in plain terms)
 
 - **Trim-only mode (no `-n`)**: if **`ffmpeg`** is found, the script **prefers ffmpeg** to cut by `-w`/`-d` and writes **H.264** (retries without audio if needed). It **does not depend on OpenCV decoding the source**, which avoids many AV1 “empty file” cases.  
 - **Tracking mode (`-n`)**: after opening the file, the script **tries to read the first frame**; if that fails, it tells you to **transcode to H.264** first.  
 - **Both modes**: after writing, it checks **frame count written** and **output file size**; on obvious failure it errors and tries to remove bad output.
 
+<a id="en-troubleshoot-fix"></a>
 #### What you should do
 
 **If you mainly need trimming (no `-n`):**  
@@ -294,6 +352,7 @@ python video_person_zoom.py source_h264.mp4 -n 10 -o /tmp/out.mp4
 **Also check:**  
 Ensure **`-w` / `-d` are within the file duration** and the source is not corrupted; read the full terminal error if problems persist.
 
+<a id="en-limits"></a>
 ### Limitations (English)
 
 - OCR quality depends on resolution, motion blur, and occlusions.  
