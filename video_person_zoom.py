@@ -14,24 +14,111 @@ Usage / 用法:
 
 Deps / 依赖: tracking needs pip install -r requirements-person-zoom.txt (easyocr, ultralytics).
 外部: ffmpeg (often required for yt-dlp merge).
+
+Profiling / 性能分析: 见同目录 profile.md；快速 CPU 采样可设环境变量 VPZ_CPROFILE=文件路径（cProfile）。
+ffmpeg 临时 H.264 加速: VPZ_FFMPEG_NVENC=0 禁用 NVENC；VPZ_FFMPEG_X264_PRESET=veryfast；VPZ_FFMPEG_X264_CRF=24。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
+
+
+def _configure_quiet_videoio() -> None:
+    """Lower FFmpeg/libav log noise (e.g. AV1 HW decode unavailable). / 降低 OpenCV FFmpeg 后端的 stderr 提示。"""
+    # Matches libavutil AV_LOG_*; -8 = quiet. Parsed when OpenCV loads libav.
+    os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
+
+_configure_quiet_videoio()
+
+
+@contextlib.contextmanager
+def _suppress_stderr_fd() -> Iterator[None]:
+    """Redirect OS stderr to /dev/null (C libraries bypass sys.stderr). / 屏蔽 fd 2，避免 libav 直接写终端。"""
+    stderr_fd = 2
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(stderr_fd)
+    try:
+        os.dup2(devnull, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved, stderr_fd)
+        os.close(saved)
+        os.close(devnull)
 
 
 def _b(cn: str, en: str) -> str:
     """User-facing bilingual text: Chinese / English."""
 
     return f"{cn} / {en}"
+
+
+def _print_dl_device_banner(yolo_device: str, *, ocr_on_gpu: bool) -> None:
+    """Print whether YOLO / EasyOCR run on CPU or GPU. / 标明人物检测与 OCR 在 CPU 还是 GPU 上执行。"""
+    y_on_gpu = yolo_device.strip().lower() != "cpu"
+    y_cn, y_en = ("GPU", "GPU") if y_on_gpu else ("CPU", "CPU")
+    o_cn, o_en = ("GPU", "GPU") if ocr_on_gpu else ("CPU", "CPU")
+    suffix_cn = ""
+    suffix_en = ""
+    if y_on_gpu:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                idx = 0
+                ds = yolo_device.strip()
+                dsl = ds.lower()
+                if dsl.startswith("cuda:"):
+                    part = ds.split(":", 1)[1]
+                    idx = int(part, 10) if part.isdigit() else torch.cuda.current_device()
+                elif ds.isdigit():
+                    idx = int(ds, 10)
+                suffix_cn = f"，GPU: {torch.cuda.get_device_name(idx)}"
+                suffix_en = f", GPU: {torch.cuda.get_device_name(idx)}"
+        except Exception:
+            pass
+    print(
+        _b(
+            f"执行设备 — YOLO（人物检测）: {y_cn}（device={yolo_device}{suffix_cn}）；"
+            f"EasyOCR（球衣号码）: {o_cn}",
+            f"Execution — YOLO (person detect): {y_en} (device={yolo_device}{suffix_en}); "
+            f"EasyOCR (jersey digits): {o_en}",
+        ),
+        file=sys.stderr,
+    )
+
+
+def _normalize_yolo_device(user_spec: str | None, *, cuda_ok: bool) -> str:
+    """
+    Map --device / default to strings Ultralytics + PyTorch accept.
+    Some versions reject bare '0'; use 'cuda:0'.
+    """
+    if not user_spec or not str(user_spec).strip():
+        return "cuda:0" if cuda_ok else "cpu"
+    s = str(user_spec).strip()
+    sl = s.lower()
+    if sl == "cpu":
+        return "cpu"
+    if sl.startswith("cuda"):
+        return s if ":" in s else "cuda:0"
+    if s.isdigit() and cuda_ok:
+        return f"cuda:{int(s, 10)}"
+    if s.isdigit() and not cuda_ok:
+        return "cpu"
+    return s
 
 
 def _is_remote(url: str) -> bool:
@@ -135,6 +222,9 @@ def _iou_xyxy(
     bb = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     u = aa + bb - inter
     return float(inter / u) if u > 1e-9 else 0.0
+
+
+_iou = _iou_xyxy
 
 
 def _list_person_boxes(result) -> list[tuple[float, float, float, float]]:
@@ -244,6 +334,117 @@ def _ffmpeg_bin() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def _ffmpeg_h264_encoder_variants() -> list[tuple[str, list[str]]]:
+    """
+    Ordered (label, ffmpeg video encode args) for temp H.264 proxies.
+    临时 H.264：优先 NVENC（快），否则 libx264（preset 默认 veryfast）。
+    Env: VPZ_FFMPEG_NVENC=0 禁用 NVENC；VPZ_FFMPEG_X264_PRESET / VPZ_FFMPEG_X264_CRF 可调 libx264。
+    """
+    out: list[tuple[str, list[str]]] = []
+    nv = (os.environ.get("VPZ_FFMPEG_NVENC") or "1").strip().lower()
+    if nv not in ("0", "false", "no", ""):
+        out.append(
+            (
+                "h264_nvenc",
+                [
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p4",
+                    "-rc",
+                    "vbr",
+                    "-cq",
+                    "26",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                ],
+            )
+        )
+    x264_preset = (os.environ.get("VPZ_FFMPEG_X264_PRESET") or "veryfast").strip() or "veryfast"
+    x264_crf = (os.environ.get("VPZ_FFMPEG_X264_CRF") or "24").strip() or "24"
+    out.append(
+        (
+            f"libx264(preset={x264_preset},crf={x264_crf})",
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                x264_preset,
+                "-crf",
+                x264_crf,
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ],
+        )
+    )
+    return out
+
+
+def _ffmpeg_run_h264_proxy(
+    input_path: str,
+    output_path: str,
+    *,
+    seek_before_input: str | None,
+    duration_after_input: str | None,
+    fail_cn: str,
+    fail_en: str,
+) -> None:
+    """
+    Encode to H.264 MP4 for OpenCV; tries NVENC then libx264.
+    seek_before_input: put -ss before -i for faster keyframe seeks on long files.
+    """
+    ff = _ffmpeg_bin()
+    if not ff:
+        raise RuntimeError(_b("未找到 ffmpeg", "ffmpeg not found in PATH"))
+
+    last_err = ("", "")
+    for label, venc in _ffmpeg_h264_encoder_variants():
+        head: list[str] = [
+            ff,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ]
+        if seek_before_input is not None:
+            head.extend(["-ss", seek_before_input])
+        head.extend(["-i", input_path])
+        if duration_after_input is not None:
+            head.extend(["-t", duration_after_input])
+        base = [*head, *venc]
+        cmd_with_audio = [*base, "-c:a", "aac", "-b:a", "128k", output_path]
+        r = subprocess.run(cmd_with_audio, capture_output=True, text=True)
+        if r.returncode == 0:
+            print(
+                _b(f"ffmpeg 视频编码: {label}", f"ffmpeg video encoder: {label}"),
+                file=sys.stderr,
+            )
+            return
+        cmd_an = [*base, "-an", output_path]
+        r2 = subprocess.run(cmd_an, capture_output=True, text=True)
+        if r2.returncode == 0:
+            print(
+                _b(
+                    f"ffmpeg 视频编码: {label}（无音轨）",
+                    f"ffmpeg video encoder: {label} (no audio)",
+                ),
+                file=sys.stderr,
+            )
+            return
+        last_err = (r.stderr or r.stdout or "", r2.stderr or r2.stdout or "")
+
+    raise SystemExit(
+        _b(
+            f"{fail_cn}\n{last_err[0]}\n---\n{last_err[1]}",
+            f"{fail_en}\n{last_err[0]}\n---\n{last_err[1]}",
+        )
+    )
+
+
 def _ffmpeg_extract_segment(
     input_path: str,
     output_path: str,
@@ -254,47 +455,40 @@ def _ffmpeg_extract_segment(
     Trim with ffmpeg to H.264+AAC MP4 (avoids OpenCV AV1 issues).
     用 ffmpeg 截取为 H.264 MP4，减轻 OpenCV 解 AV1 失败。
     """
-    ff = _ffmpeg_bin()
-    if not ff:
-        raise RuntimeError(_b("未找到 ffmpeg", "ffmpeg not found in PATH"))
-
-    base = [
-        ff,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
+    _ffmpeg_run_h264_proxy(
         input_path,
-        "-ss",
-        str(start_sec),
-        "-t",
-        str(duration_sec),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-    ]
-    cmd_with_audio = [*base, "-c:a", "aac", "-b:a", "192k", output_path]
-    r = subprocess.run(cmd_with_audio, capture_output=True, text=True)
-    if r.returncode != 0:
-        cmd_an = [*base, "-an", output_path]
-        r2 = subprocess.run(cmd_an, capture_output=True, text=True)
-        if r2.returncode != 0:
-            raise SystemExit(
-                _b(
-                    "ffmpeg 截取失败（含无音轨重试）。stderr:\n"
-                    f"{r.stderr or r.stdout}\n---\n{r2.stderr or r2.stdout}",
-                    "ffmpeg trim failed (including no-audio retry). stderr:\n"
-                    f"{r.stderr or r.stdout}\n---\n{r2.stderr or r2.stdout}",
-                )
-            )
+        output_path,
+        seek_before_input=str(start_sec),
+        duration_after_input=str(duration_sec),
+        fail_cn="ffmpeg 截取失败（已尝试 NVENC / libx264，含无音轨重试）。stderr:",
+        fail_en="ffmpeg trim failed (tried NVENC / libx264, including no-audio). stderr:",
+    )
+
+
+def _ffmpeg_transcode_full_to_h264(input_path: str, output_path: str) -> None:
+    """
+    Full remux/transcode to H.264 MP4 for OpenCV-friendly decode.
+    整片转 H.264 MP4，便于 OpenCV 读帧。
+    """
+    _ffmpeg_run_h264_proxy(
+        input_path,
+        output_path,
+        seek_before_input=None,
+        duration_after_input=None,
+        fail_cn="ffmpeg 整片转码失败（已尝试 NVENC / libx264，含无音轨重试）。stderr:",
+        fail_en="ffmpeg full transcode failed (tried NVENC / libx264, including no-audio). stderr:",
+    )
+
+
+def _try_reset_capture_first_frame(cap: object) -> bool:
+    """Read one frame and seek back to 0; False if decode failed. / 读首帧并回绕到 0，失败返回 False。"""
+    import cv2
+
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return False
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+    return True
 
 
 def _clip_segment_start_and_duration(
@@ -313,26 +507,6 @@ def _clip_segment_start_and_duration(
     half = d / 2.0
     start_sec = max(0.0, c - half)
     return start_sec, d
-
-
-def _ensure_capture_readable(cap: object, input_path: str) -> None:
-    """Read first frame or exit with transcode hint. / 读首帧，失败则提示转码。"""
-    import cv2
-
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        raise SystemExit(
-            _b(
-                "无法从视频解码出第一帧。若片源为 AV1 或本机无硬解，OpenCV 可能读不到画面。\n"
-                "请先转码为 H.264 再处理，例如：\n"
-                f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
-                "Cannot decode the first frame (AV1 or no HW decode may fail in OpenCV).\n"
-                "Transcode to H.264 first, e.g.:\n"
-                f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
-            )
-        )
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
 
 
 def _assert_output_not_empty(path: str, frames_written: int) -> None:
@@ -398,14 +572,23 @@ def process_clip_only(
     """Trim [-w,-d] window; prefers ffmpeg. / 仅截取时间窗，优先 ffmpeg。"""
     import cv2
 
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
+    print(
+        _b(
+            "执行设备 — 仅截取模式：解码/重编码在 CPU 上（ffmpeg 或 OpenCV），未使用 GPU 神经网络。",
+            "Execution — trim-only: decode/re-encode on CPU (ffmpeg or OpenCV); no GPU neural nets.",
+        ),
+        file=sys.stderr,
+    )
 
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    with _suppress_stderr_fd():
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     start_sec, seg_dur = _clip_segment_start_and_duration(
         fps, nframes, center_sec, duration_sec
@@ -459,17 +642,18 @@ def process_clip_only(
         return
 
     cap.release()
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise SystemExit(_b(f"无法重新打开视频: {input_path}", f"Cannot reopen video: {input_path}"))
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    with _suppress_stderr_fd():
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise SystemExit(_b(f"无法重新打开视频: {input_path}", f"Cannot reopen video: {input_path}"))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    clip_frames_total, start_sec_print, end_sec_print = _clip_seek_cap(
-        cap, fps, nframes, center_sec, duration_sec
-    )
+        clip_frames_total, start_sec_print, end_sec_print = _clip_seek_cap(
+            cap, fps, nframes, center_sec, duration_sec
+        )
     print(
         _b(
             f"回退 OpenCV 逐帧写入: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
@@ -488,9 +672,15 @@ def process_clip_only(
         raise SystemExit(_b(f"无法创建输出文件: {output_path}", f"Cannot create output: {output_path}"))
 
     frames_out = 0
+    first_read = True
     try:
         while frames_out < clip_frames_total:
-            ok, frame = cap.read()
+            if first_read:
+                with _suppress_stderr_fd():
+                    ok, frame = cap.read()
+                first_read = False
+            else:
+                ok, frame = cap.read()
             if not ok:
                 break
             if frame.shape[1] != w or frame.shape[0] != h:
@@ -532,14 +722,14 @@ def _jersey_roi_xyxy(
 
 
 def _ocr_text_matches_target(texts: list[str], target: str) -> bool:
-    """Whether OCR digit runs match target exactly. / 数字串是否与目标一致。"""
+    """Strict full-number OCR match. / 严格整号匹配，避免 9 误匹配 90。"""
     segs: list[str] = []
     for raw in texts:
         segs.append("".join(c for c in raw if c.isdigit()))
     combined = "".join(segs)
-    if combined == target:
-        return True
-    return any(s == target for s in segs if s)
+    # Strict mode: only accept full concatenated digits == target.
+    # Example: OCR ["9", "0"] => "90", will NOT match target "9".
+    return combined == target
 
 
 def _ocr_jersey_match(
@@ -672,6 +862,87 @@ def _expand_and_clip_box(
     return nx1, ny1, nx2, ny2
 
 
+def _center_crop_with_zoom_limit(
+    cx: float,
+    cy: float,
+    person_w: float,
+    person_h: float,
+    frame_w: int,
+    frame_h: int,
+    padding: float,
+    max_zoom: float,
+) -> tuple[int, int, int, int]:
+    """
+    Center crop around target while capping zoom-in.
+    以目标为中心裁剪，并限制最大放大倍数（避免超过 max_zoom）。
+    """
+    max_zoom = max(1.0, float(max_zoom))
+    bw = max(1.0, person_w * (1.0 + max(0.0, padding)))
+    bh = max(1.0, person_h * (1.0 + max(0.0, padding)))
+    # Keep crop at least this large so output zoom never exceeds max_zoom.
+    bw = max(bw, frame_w / max_zoom)
+    bh = max(bh, frame_h / max_zoom)
+    return _expand_and_clip_box(
+        cx - bw / 2.0,
+        cy - bh / 2.0,
+        cx + bw / 2.0,
+        cy + bh / 2.0,
+        frame_w,
+        frame_h,
+        0.0,
+    )
+
+
+class _AsyncSegmentWriter:
+    """Background MP4 writer so detection loop can continue."""
+
+    def __init__(self, path: str, fourcc: int, fps: float, out_size: tuple[int, int]) -> None:
+        self.path = path
+        self._fourcc = fourcc
+        self._fps = fps
+        self._out_size = out_size
+        self._q: queue.Queue[object] = queue.Queue(maxsize=64)
+        self._ready = threading.Event()
+        self._ok = False
+        self._t = threading.Thread(target=self._worker, daemon=True)
+        self._t.start()
+        self._ready.wait(timeout=5.0)
+
+    def _worker(self) -> None:
+        import cv2
+
+        writer = cv2.VideoWriter(self.path, self._fourcc, self._fps, self._out_size)
+        self._ok = bool(writer.isOpened())
+        self._ready.set()
+        if not self._ok:
+            return
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                writer.write(item)  # item is ndarray frame
+        finally:
+            writer.release()
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    def write(self, frame) -> bool:
+        if not self._ok:
+            return False
+        # copy() prevents aliasing with later frame buffer reuse
+        self._q.put(frame.copy())
+        return True
+
+    def close(self) -> None:
+        if not self._ok:
+            return
+        self._q.put(None)
+        self._t.join(timeout=10.0)
+
+
 def _smooth_box(
     prev: tuple[float, float, float, float] | None,
     cur: tuple[float, float, float, float],
@@ -698,7 +969,11 @@ def process_video(
     max_jersey_search_frames: int,
     clip_center_sec: float | None,
     clip_duration_sec: float | None,
-) -> None:
+    segment_duration_sec: float,
+    max_segments: int,
+    max_parallel_writers: int,
+    pre_roll_sec: float,
+) -> list[str]:
     try:
         import cv2
         import easyocr
@@ -711,43 +986,165 @@ def process_video(
             )
         ) from e
 
-    use_cuda = bool(device and device.startswith("cuda"))
-    if not use_cuda:
-        try:
-            import torch
+    try:
+        import torch
 
-            use_cuda = torch.cuda.is_available()
-        except Exception:
-            use_cuda = False
+        cuda_ok = torch.cuda.is_available()
+    except Exception:
+        cuda_ok = False
+
+    # EasyOCR: GPU when CUDA is available unless user forces --device cpu.
+    if device and device.strip().lower() == "cpu":
+        use_cuda = False
+    else:
+        use_cuda = cuda_ok
+
+    if not device:
+        print(
+            _b(
+                "未指定 --device："
+                + ("已检测到 CUDA，YOLO 与 EasyOCR 将使用 GPU。" if cuda_ok else "未检测到可用 CUDA，YOLO 与 EasyOCR 使用 CPU。"),
+                "No --device: "
+                + ("CUDA detected; YOLO and EasyOCR use GPU." if cuda_ok else "CUDA not available; YOLO and EasyOCR use CPU."),
+            ),
+            file=sys.stderr,
+        )
 
     ocr_reader = easyocr.Reader(["en"], gpu=use_cuda)
 
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
+    decode_tmp: str | None = None
+    clip_via_ffmpeg_prefetch = False
+    clip_print_start = 0.0
+    clip_print_end = 0.0
 
-    _ensure_capture_readable(cap, input_path)
+    with _suppress_stderr_fd():
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise SystemExit(_b(f"无法打开视频: {input_path}", f"Cannot open video: {input_path}"))
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
+    with _suppress_stderr_fd():
+        first_ok = _try_reset_capture_first_frame(cap)
+
+    if not first_ok:
+        cap.release()
+        ff = _ffmpeg_bin()
+        if not ff:
+            raise SystemExit(
+                _b(
+                    "无法从视频解码出第一帧（常见于 AV1 与 OpenCV）。未找到 ffmpeg，无法自动转码。\n"
+                    "请安装 ffmpeg 后重试，或手动转 H.264，例如：\n"
+                    f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
+                    "Cannot decode the first frame (often AV1 + OpenCV). ffmpeg not found for auto-transcode.\n"
+                    "Install ffmpeg and retry, or transcode manually, e.g.:\n"
+                    f"  ffmpeg -i \"{input_path}\" -c:v libx264 -crf 23 -c:a copy \"{input_path}.h264.mp4\"",
+                )
+            )
+        fd, decode_tmp = tempfile.mkstemp(suffix=".mp4", prefix="vpz_ocvproxy_")
+        os.close(fd)
+        try:
+            want_clip_prefetch = clip_center_sec is not None and clip_duration_sec is not None
+            if want_clip_prefetch:
+                ss, dur = _clip_segment_start_and_duration(
+                    fps, nframes, float(clip_center_sec), float(clip_duration_sec)
+                )
+                clip_print_start, clip_print_end = ss, ss + dur
+                print(
+                    _b(
+                        "OpenCV 无法解码首帧，已用 ffmpeg 截取目标片段为临时 H.264 再处理。",
+                        "OpenCV could not decode the first frame; using ffmpeg clip → temp H.264.",
+                    ),
+                    file=sys.stderr,
+                )
+                _ffmpeg_extract_segment(input_path, decode_tmp, ss, dur)
+                clip_via_ffmpeg_prefetch = True
+            else:
+                print(
+                    _b(
+                        "OpenCV 无法解码首帧，已用 ffmpeg 将整片转码为临时 H.264 再处理（可能较慢）。",
+                        "OpenCV could not decode the first frame; full ffmpeg transcode to temp H.264 (may be slow).",
+                    ),
+                    file=sys.stderr,
+                )
+                _ffmpeg_transcode_full_to_h264(input_path, decode_tmp)
+
+            with _suppress_stderr_fd():
+                cap = cv2.VideoCapture(decode_tmp)
+            if not cap.isOpened():
+                raise SystemExit(
+                    _b(
+                        "ffmpeg 输出后仍无法用 OpenCV 打开临时文件。",
+                        "ffmpeg produced output OpenCV still cannot open.",
+                    )
+                )
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or fps)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            with _suppress_stderr_fd():
+                second_ok = _try_reset_capture_first_frame(cap)
+            if not second_ok:
+                cap.release()
+                raise SystemExit(
+                    _b(
+                        "ffmpeg 转码/截取后 OpenCV 仍读不到首帧，请检查片源或 ffmpeg 日志。",
+                        "Still cannot read the first frame after ffmpeg; check source or ffmpeg logs.",
+                    )
+                )
+        except SystemExit:
+            if decode_tmp:
+                try:
+                    os.remove(decode_tmp)
+                except OSError:
+                    pass
+            raise
+        except Exception as e:
+            if decode_tmp:
+                try:
+                    os.remove(decode_tmp)
+                except OSError:
+                    pass
+            raise SystemExit(_b(f"ffmpeg 预处理失败: {e}", f"ffmpeg preprocess failed: {e}")) from e
+
     clip_frames_total: int | None = None
     if clip_center_sec is not None and clip_duration_sec is not None:
-        clip_frames_total, start_sec_print, end_sec_print = _clip_seek_cap(
-            cap, fps, nframes, float(clip_center_sec), float(clip_duration_sec)
-        )
-        print(
-            _b(
-                f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
-                f"共 {clip_frames_total} 帧（-w 中心 -d 总长）。",
-                f"Output clip: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
-                f"{clip_frames_total} frames (-w center, -d duration).",
-            ),
-            file=sys.stderr,
-        )
+        if clip_via_ffmpeg_prefetch:
+            clip_frames_total = (
+                nframes if nframes > 0 else max(1, int(float(clip_duration_sec) * max(fps, 1e-3)))
+            )
+            start_sec_print, end_sec_print = clip_print_start, clip_print_end
+            print(
+                _b(
+                    f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
+                    f"约 {clip_frames_total} 帧（ffmpeg 预截取）。",
+                    f"Output clip: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
+                    f"~{clip_frames_total} frames (ffmpeg pre-cut).",
+                ),
+                file=sys.stderr,
+            )
+        else:
+            clip_frames_total, start_sec_print, end_sec_print = _clip_seek_cap(
+                cap, fps, nframes, float(clip_center_sec), float(clip_duration_sec)
+            )
+            print(
+                _b(
+                    f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
+                    f"共 {clip_frames_total} 帧（-w 中心 -d 总长）。",
+                    f"Output clip: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
+                    f"{clip_frames_total} frames (-w center, -d duration).",
+                ),
+                file=sys.stderr,
+            )
     elif clip_center_sec is not None or clip_duration_sec is not None:
+        if decode_tmp:
+            try:
+                os.remove(decode_tmp)
+            except OSError:
+                pass
         raise SystemExit(
             _b(
                 "请同时提供 -w 与 -d，或两者都不提供以处理整段视频。",
@@ -756,15 +1153,29 @@ def process_video(
         )
 
     out_w, out_h = w - (w % 2), h - (h % 2)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
-    if not writer.isOpened():
-        cap.release()
-        raise SystemExit(_b(f"无法创建输出文件: {output_path}", f"Cannot create output: {output_path}"))
+    segment_dir = os.path.dirname(output_path) or os.getcwd()
+    seg_fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    seg_duration = max(0.1, float(segment_duration_sec))
+    seg_frames_total = max(1, int(round(seg_duration * fps)))
+    pre_roll_frames = max(0, int(round(max(0.0, float(pre_roll_sec)) * fps)))
+    active_segments: list[dict[str, object]] = []
+    saved_segments: list[str] = []
+    warned_parallel_limit = False
+    next_segment_detect_sec = 0.0
+    recent_out_frames: deque = deque(maxlen=max(1, pre_roll_frames + 1))
 
     model = YOLO(model_name)
-    if device:
-        model.to(device)
+    infer_device = _normalize_yolo_device(device, cuda_ok=cuda_ok)
+    if infer_device.lower() != "cpu":
+        model.to(infer_device)
+    _print_dl_device_banner(infer_device, ocr_on_gpu=use_cuda)
+    print(
+        _b(
+            "执行设备 — 裁切/缩放在 CPU 上（每帧 BGR 处理）；仅输出识别片段。",
+            "Execution — crop/resize on CPU (per-frame BGR processing); only detected segments are written.",
+        ),
+        file=sys.stderr,
+    )
 
     prev_smooth: tuple[float, float, float, float] | None = None
     last_box: tuple[float, float, float, float] | None = None
@@ -773,24 +1184,15 @@ def process_video(
     warned_jersey_relock = False
     lock_announced = False
     frame_i = 0
-    frames_out = 0
-    total_written = 0
-    infer_device = device or "cpu"
     progress_total = clip_frames_total if clip_frames_total is not None else nframes
 
     def _write_full_and_maybe_abort() -> None:
-        """Full frame until lock or search limit. / 锁定前全画面或超帧退出。"""
-        nonlocal frames_out, total_written
-        out = cv2.resize(frame, (out_w, out_h))
-        writer.write(out)
-        total_written += 1
-        if clip_frames_total is not None:
-            frames_out += 1
+        """Before first lock: keep scanning only; no output. / 首次锁定前只扫描，不写输出。"""
         if frame_i == 1:
             print(
                 _b(
-                    "正在扫描球衣号码：输出暂为全画面，直至首次识别成功。",
-                    "Scanning jersey number: full frame until first successful read.",
+                    "正在扫描球衣号码：仅在识别到目标后开始写片段。",
+                    "Scanning jersey number: segment output starts after a successful match.",
                 ),
                 file=sys.stderr,
             )
@@ -810,7 +1212,7 @@ def process_video(
 
     try:
         while True:
-            if clip_frames_total is not None and frames_out >= clip_frames_total:
+            if clip_frames_total is not None and frame_i >= clip_frames_total:
                 break
             ok, frame = cap.read()
             if not ok:
@@ -819,6 +1221,8 @@ def process_video(
             if frame.shape[1] != w or frame.shape[0] != h:
                 frame = cv2.resize(frame, (w, h))
 
+            box: tuple[float, float, float, float] | None = None
+            detected_this_frame = False
             results = model.predict(
                 frame,
                 classes=[0],
@@ -826,7 +1230,6 @@ def process_video(
                 device=infer_device,
             )
             persons = _list_person_boxes(results[0])
-            box: tuple[float, float, float, float] | None = None
 
             if persons:
                 if locked_ref_xyxy is not None:
@@ -848,6 +1251,7 @@ def process_video(
                         )
                         if ocr_hit is not None:
                             box = ocr_hit
+                            detected_this_frame = True
                             if not warned_jersey_relock:
                                 print(
                                     _b(
@@ -880,6 +1284,7 @@ def process_video(
                         _write_full_and_maybe_abort()
                         continue
                     box = jb
+                    detected_this_frame = True
                     if not lock_announced:
                         print(
                             _b(
@@ -909,19 +1314,122 @@ def process_video(
             hy1 = sy - sh / 2.0
             hx2 = sx + sw / 2.0
             hy2 = sy + sh / 2.0
-            ix1, iy1, ix2, iy2 = _expand_and_clip_box(hx1, hy1, hx2, hy2, w, h, padding)
+            ix1, iy1, ix2, iy2 = _center_crop_with_zoom_limit(
+                sx,
+                sy,
+                hx2 - hx1,
+                hy2 - hy1,
+                w,
+                h,
+                padding,
+                1.1,
+            )
 
             crop = frame[iy1:iy2, ix1:ix2]
             out = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-            writer.write(out)
-            frames_out += 1
-            total_written += 1
+            recent_out_frames.append(out)
+            still_active: list[dict[str, object]] = []
+            for seg in active_segments:
+                sw = seg["writer"]
+                rem = int(seg["remaining"])
+                pth = str(seg["path"])
+                if isinstance(sw, _AsyncSegmentWriter):
+                    if bool(seg.get("skip_once", False)):
+                        seg["skip_once"] = False
+                    else:
+                        sw.write(out)
+                        rem -= 1
+                    if rem <= 0:
+                        sw.close()
+                        saved_segments.append(pth)
+                        print(
+                            _b(
+                                f"片段已保存: {pth}",
+                                f"Segment saved: {pth}",
+                            ),
+                            file=sys.stderr,
+                        )
+                    else:
+                        seg["remaining"] = rem
+                        still_active.append(seg)
+            active_segments = still_active
+            if detected_this_frame:
+                detect_t = max(0.0, (frame_i - 1) / max(fps, 1e-6))
+                can_start = True
+                if detect_t < next_segment_detect_sec:
+                    # New segment can only be triggered at/after previous window end.
+                    # 允许的最大重叠仅来自 pre-roll。
+                    can_start = False
+                if max_segments > 0 and len(saved_segments) + len(active_segments) >= max_segments:
+                    can_start = False
+                if not can_start:
+                    pass
+                elif len(active_segments) >= max_parallel_writers:
+                    if not warned_parallel_limit:
+                        print(
+                            _b(
+                                f"并行写入已达上限({max_parallel_writers})，暂不启动新片段。",
+                                f"Parallel writers at limit ({max_parallel_writers}); skipping new segment start.",
+                            ),
+                            file=sys.stderr,
+                        )
+                        warned_parallel_limit = True
+                else:
+                    warned_parallel_limit = False
+                    start_sec = max(0.0, detect_t - max(0.0, float(pre_roll_sec)))
+                    end_sec = start_sec + seg_duration
+                    segment_name = f"{jersey}-{start_sec:.3f}-{end_sec:.3f}.mp4"
+                    segment_path = os.path.join(segment_dir, segment_name)
+                    sw = _AsyncSegmentWriter(segment_path, seg_fourcc, fps, (out_w, out_h))
+                    if sw.ok:
+                        prefill = list(recent_out_frames)
+                        for f in prefill:
+                            sw.write(f)
+                        rem = max(0, int(seg_frames_total) - len(prefill))
+                        if rem <= 0:
+                            sw.close()
+                            saved_segments.append(segment_path)
+                            print(
+                                _b(
+                                    f"片段已保存: {segment_path}",
+                                    f"Segment saved: {segment_path}",
+                                ),
+                                file=sys.stderr,
+                            )
+                            next_segment_detect_sec = end_sec
+                        else:
+                            active_segments.append(
+                                {
+                                    "writer": sw,
+                                    "remaining": rem,
+                                    "path": segment_path,
+                                    "skip_once": True,
+                                }
+                            )
+                            print(
+                                _b(
+                                    f"新片段: {segment_name}",
+                                    f"New segment: {segment_name}",
+                                ),
+                                file=sys.stderr,
+                            )
+                            next_segment_detect_sec = end_sec
+                    else:
+                        print(
+                            _b(
+                                f"警告: 无法创建片段文件 {segment_name}",
+                                f"Warning: cannot create segment file {segment_name}",
+                            ),
+                            file=sys.stderr,
+                        )
+            if max_segments > 0 and len(saved_segments) >= max_segments:
+                break
 
             if clip_frames_total is not None:
-                if clip_frames_total and frames_out % max(1, clip_frames_total // 20) == 0:
-                    pct = 100.0 * frames_out / clip_frames_total
+                if clip_frames_total and frame_i % max(1, clip_frames_total // 20) == 0:
+                    pct = 100.0 * frame_i / clip_frames_total
                     print(
-                        f"\r{_b('进度', 'Progress')}: {frames_out}/{clip_frames_total} ({pct:.0f}%)",
+                        f"\r{_b('进度', 'Progress')}: {frame_i}/{clip_frames_total} ({pct:.0f}%)",
                         end="",
                         file=sys.stderr,
                     )
@@ -935,9 +1443,24 @@ def process_video(
     finally:
         print(file=sys.stderr)
         cap.release()
-        writer.release()
-
-    _assert_output_not_empty(output_path, total_written)
+        for seg in active_segments:
+            sw = seg["writer"]
+            pth = str(seg["path"])
+            if isinstance(sw, _AsyncSegmentWriter):
+                sw.close()
+                saved_segments.append(pth)
+                print(
+                    _b(
+                        f"片段已保存: {pth}",
+                        f"Segment saved: {pth}",
+                    ),
+                    file=sys.stderr,
+                )
+        if decode_tmp:
+            try:
+                os.remove(decode_tmp)
+            except OSError:
+                pass
 
     if last_box is None:
         raise SystemExit(
@@ -946,6 +1469,115 @@ def process_video(
                 f"Could not lock jersey {jersey}: need at least one frame with a person and readable number.",
             )
         )
+    if not saved_segments:
+        raise SystemExit(
+            _b(
+                "已识别到目标球衣，但未成功写出片段文件。",
+                "Target jersey was detected, but no segment file was written.",
+            )
+        )
+    return saved_segments
+
+
+def _audio_rms_windows(input_path: str, *, sample_rate: int = 16000, win_sec: float = 0.5) -> list[float]:
+    """Extract RMS energy windows from audio via ffmpeg pipe."""
+    ff = _ffmpeg_bin()
+    if not ff:
+        raise RuntimeError(_b("未找到 ffmpeg", "ffmpeg not found in PATH"))
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        input_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert p.stdout is not None
+    import numpy as np
+
+    win_samples = max(1, int(round(sample_rate * max(0.05, float(win_sec)))))
+    chunk_bytes = win_samples * 2
+    vals: list[float] = []
+    while True:
+        buf = p.stdout.read(chunk_bytes)
+        if not buf:
+            break
+        arr = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+        if arr.size == 0:
+            continue
+        rms = float(np.sqrt(np.mean(arr * arr)))
+        vals.append(rms)
+    p.wait(timeout=30)
+    return vals
+
+
+def _detect_audio_peaks(rms: list[float], *, win_sec: float, min_gap_sec: float) -> list[float]:
+    """Simple robust peak picking on RMS envelope."""
+    if not rms:
+        return []
+    import numpy as np
+
+    x = np.asarray(rms, dtype=np.float32)
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med))) + 1e-6
+    thr = med + 6.0 * mad
+    min_gap_n = max(1, int(round(min_gap_sec / max(win_sec, 1e-6))))
+    peaks: list[int] = []
+    i = 0
+    n = int(x.shape[0])
+    while i < n:
+        if x[i] >= thr:
+            j = min(n, i + min_gap_n)
+            k = i + int(np.argmax(x[i:j]))
+            peaks.append(k)
+            i = j
+        else:
+            i += 1
+    return [float(k) * win_sec for k in peaks]
+
+
+def process_goal_events(
+    input_path: str,
+    output_dir: str,
+    *,
+    duration_sec: float,
+    pre_roll_sec: float,
+    max_clips: int,
+) -> list[str]:
+    """
+    Lightweight goal spotting by audio excitement peaks.
+    轻量进球捕获：基于音频能量峰值生成候选片段。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    win_sec = 0.5
+    rms = _audio_rms_windows(input_path, win_sec=win_sec)
+    peaks = _detect_audio_peaks(
+        rms,
+        win_sec=win_sec,
+        min_gap_sec=max(4.0, float(duration_sec) - max(0.0, float(pre_roll_sec))),
+    )
+    if not peaks:
+        return []
+    out_paths: list[str] = []
+    for t in peaks:
+        start_sec = max(0.0, t - max(0.0, float(pre_roll_sec)))
+        end_sec = start_sec + float(duration_sec)
+        name = f"goal-{start_sec:.3f}-{end_sec:.3f}.mp4"
+        out_path = os.path.join(output_dir, name)
+        _ffmpeg_extract_segment(input_path, out_path, start_sec, float(duration_sec))
+        out_paths.append(out_path)
+        if max_clips > 0 and len(out_paths) >= max_clips:
+            break
+    return out_paths
 
 
 def main() -> None:
@@ -971,6 +1603,14 @@ def main() -> None:
         help=_b(
             "要跟拍的球衣号码（仅数字）。无 -n 且无 -w/-d：仅下载或复制",
             "Jersey number (digits). Without -n and without -w/-d: download or copy only",
+        ),
+    )
+    p.add_argument(
+        "--goal-detect",
+        action="store_true",
+        help=_b(
+            "进球捕获模式：按音频峰值自动切疑似进球片段",
+            "Goal spotting mode: auto-cut likely goal clips by audio peaks",
         ),
     )
     p.add_argument(
@@ -1012,8 +1652,8 @@ def main() -> None:
         "--device",
         default="",
         help=_b(
-            "推理设备，如 cpu、cuda:0；留空由 Ultralytics 选择",
-            "Inference device, e.g. cpu, cuda:0; empty lets Ultralytics choose",
+            "YOLO / EasyOCR：cpu、cuda:0、1（=cuda:1）等；留空则自动检测 CUDA，有则用 GPU",
+            "YOLO / EasyOCR: cpu, cuda:0, digit maps to cuda:N; empty auto-detects CUDA and uses GPU if present",
         ),
     )
     p.add_argument(
@@ -1085,32 +1725,74 @@ def main() -> None:
         type=float,
         default=None,
         help=_b(
-            "片段总时长（秒），以 -w 为中心对称截取；须与 -w 同用",
-            "Clip length in seconds, symmetric around -w; use with -w",
+            "无 -n 时：与 -w 同用做截取时长；有 -n 时：每个识别片段时长（默认 10 秒）",
+            "Without -n: use with -w as trim length; with -n: per-detected segment length (default 10s)",
+        ),
+    )
+    p.add_argument(
+        "-c",
+        "--max-clips",
+        type=int,
+        default=0,
+        help=_b(
+            "仅 -n 模式：最多生成多少个片段后退出；0 表示处理到文件末尾",
+            "Only with -n: stop after this many clips; 0 means run to end of input",
+        ),
+    )
+    p.add_argument(
+        "--max-parallel-writers",
+        type=int,
+        default=3,
+        help=_b(
+            "仅 -n 模式：最多并行片段写入数，默认 3",
+            "Only with -n: maximum concurrent segment writers, default 3",
+        ),
+    )
+    p.add_argument(
+        "--pre-roll",
+        type=float,
+        default=2.0,
+        help=_b(
+            "仅 -n 模式：每个片段在检测时刻前保留多少秒，默认 2 秒",
+            "Only with -n: seconds kept before detection time in each segment, default 2s",
         ),
     )
     args = p.parse_args()
-
-    if (args.window is None) != (args.duration is None):
-        p.error(
-            _b(
-                "请同时提供 -w 与 -d，或两者都不提供。",
-                "Provide both -w and -d, or neither.",
-            )
-        )
 
     raw = args.input.strip()
     if not raw:
         p.error(_b("请提供输入路径或 URL", "Provide input path or URL"))
 
     has_jersey = bool(args.jersey_number and str(args.jersey_number).strip())
+    has_goal_detect = bool(args.goal_detect)
     has_clip = args.window is not None
 
+    if has_goal_detect and has_jersey:
+        p.error(_b("--goal-detect 与 -n 不能同时使用", "--goal-detect cannot be used with -n"))
+
     if has_jersey:
+        if args.window is not None and args.duration is None:
+            p.error(
+                _b(
+                    "-n 模式下，提供 -w 时必须同时提供 -d。",
+                    "With -n, -w requires -d.",
+                )
+            )
         try:
             jersey_norm = _normalize_jersey_target(str(args.jersey_number))
         except ValueError as e:
             p.error(str(e))
+        segment_duration_sec = 10.0
+        if args.duration is not None:
+            segment_duration_sec = float(args.duration)
+            if segment_duration_sec <= 0:
+                p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
+        if args.max_clips < 0:
+            p.error(_b("-c 不能为负数", "-c must be non-negative"))
+        if args.max_parallel_writers <= 0:
+            p.error(_b("--max-parallel-writers 必须大于 0", "--max-parallel-writers must be > 0"))
+        if args.pre_roll < 0:
+            p.error(_b("--pre-roll 不能为负数", "--pre-roll must be non-negative"))
         clip_center_sec: float | None = None
         clip_duration_sec: float | None = None
         if has_clip:
@@ -1121,6 +1803,18 @@ def main() -> None:
             clip_duration_sec = float(args.duration)
             if clip_duration_sec <= 0:
                 p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
+    elif has_goal_detect:
+        segment_duration_sec = 10.0
+        if args.duration is not None:
+            segment_duration_sec = float(args.duration)
+            if segment_duration_sec <= 0:
+                p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
+        if args.max_clips < 0:
+            p.error(_b("-c 不能为负数", "-c must be non-negative"))
+        if args.pre_roll < 0:
+            p.error(_b("--pre-roll 不能为负数", "--pre-roll must be non-negative"))
+        if has_clip:
+            p.error(_b("--goal-detect 不使用 -w", "--goal-detect does not use -w"))
     elif has_clip:
         try:
             clip_only_center = _parse_time_to_seconds(args.window)
@@ -1129,13 +1823,20 @@ def main() -> None:
         clip_only_duration = float(args.duration)
         if clip_only_duration <= 0:
             p.error(_b("-d 时长必须大于 0", "-d duration must be positive"))
+    elif args.duration is not None:
+        p.error(
+            _b(
+                "无 -n 时，-d 需与 -w 同时使用。",
+                "Without -n, -d must be used with -w.",
+            )
+        )
     else:
         out_opt = args.output.strip() if args.output else None
         final_path = _download_or_copy_only(raw, out_opt)
         print(final_path)
         return
 
-    clip_trim = not has_jersey and has_clip
+    clip_trim = (not has_jersey) and (not has_goal_detect) and has_clip
 
     tmpdir_to_remove: str | None = None
     local_path = raw
@@ -1148,6 +1849,8 @@ def main() -> None:
             out_path = args.output
         elif clip_trim:
             out_path = str(Path.cwd() / f"clip_{int(time.time())}.mp4")
+        elif has_goal_detect:
+            out_path = str(Path.cwd() / f"goals_{int(time.time())}.mp4")
         else:
             out_path = str(
                 Path.cwd() / f"jersey{jersey_norm}_zoom_{int(time.time())}.mp4"
@@ -1161,6 +1864,9 @@ def main() -> None:
         elif clip_trim:
             src = Path(local_path)
             out_path = str(src.with_name(f"{src.stem}_clip.mp4"))
+        elif has_goal_detect:
+            src = Path(local_path)
+            out_path = str(src.with_name(f"{src.stem}_goals.mp4"))
         else:
             src = Path(local_path)
             out_path = str(
@@ -1181,11 +1887,19 @@ def main() -> None:
                 center_sec=clip_only_center,
                 duration_sec=clip_only_duration,
             )
+        elif has_goal_detect:
+            segment_paths = process_goal_events(
+                local_path,
+                os.path.dirname(out_path) or os.getcwd(),
+                duration_sec=segment_duration_sec,
+                pre_roll_sec=args.pre_roll,
+                max_clips=args.max_clips,
+            )
         else:
             msearch = args.max_search_frames
             if msearch < 0:
                 p.error(_b("--max-search-frames 不能为负数", "--max-search-frames must be non-negative"))
-            process_video(
+            segment_paths = process_video(
                 local_path,
                 out_path,
                 model_name=args.model,
@@ -1200,13 +1914,40 @@ def main() -> None:
                 max_jersey_search_frames=msearch,
                 clip_center_sec=clip_center_sec,
                 clip_duration_sec=clip_duration_sec,
+                segment_duration_sec=segment_duration_sec,
+                max_segments=args.max_clips,
+                max_parallel_writers=args.max_parallel_writers,
+                pre_roll_sec=args.pre_roll,
             )
     finally:
         if tmpdir_to_remove and os.path.isdir(tmpdir_to_remove):
             shutil.rmtree(tmpdir_to_remove, ignore_errors=True)
 
-    print(out_path)
+    if has_jersey or has_goal_detect:
+        for pth in segment_paths:
+            print(pth)
+    else:
+        print(out_path)
 
 
 if __name__ == "__main__":
-    main()
+    _vpz_cprof = os.environ.get("VPZ_CPROFILE", "").strip()
+    if _vpz_cprof:
+        import cProfile
+
+        pr = cProfile.Profile()
+        pr.enable()
+        try:
+            main()
+        finally:
+            pr.disable()
+            pr.dump_stats(_vpz_cprof)
+            print(
+                _b(
+                    f"cProfile 统计已写入: {_vpz_cprof}（可用 pstats 或 snakeviz 查看）",
+                    f"cProfile stats written: {_vpz_cprof} (inspect with pstats or snakeviz)",
+                ),
+                file=sys.stderr,
+            )
+    else:
+        main()
