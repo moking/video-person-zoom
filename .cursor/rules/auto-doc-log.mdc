@@ -1,0 +1,18 @@
+---
+description: Keep feature.md and optimization.md synchronized with code changes
+alwaysApply: true
+---
+
+# Auto Doc Log Rule
+
+For implementation tasks in this repository:
+
+1. Apply the `update-release-notes` skill.
+2. If a change is a user-visible capability/behavior, append an entry to `feature.md`.
+3. If a change is an accuracy/performance/reliability optimization, append an entry to `optimization.md`.
+4. If both apply, update both files in the same task.
+5. Preserve bilingual order: English first, Chinese second.
+6. Maintain TOC and cross-links when adding new sections.
+7. Do not remove or rewrite unrelated historical entries; append only.
+
+Before final response, verify doc updates are included in the summary.
