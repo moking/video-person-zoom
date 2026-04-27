@@ -117,7 +117,7 @@ video_person_zoom.py INPUT [选项]
 | `--target-index` | 在上述排序下的 0 起始下标（跟丢且 OCR 失败时的几何回退）。 |
 | `--min-iou` | 帧间 IoU 低于该值时尝试用号码 OCR 重锁，默认 `0.2`。 |
 | `--ocr-min-conf` | EasyOCR 置信度下限，默认 `0.15`。 |
-| `--max-search-frames` | 从处理起点起最多多少帧内必须首次识别到号码；`0` 表示不限制；默认 `2400`。 |
+| `--max-search-frames` | 从处理起点起最多多少帧内必须首次识别到号码；`0` 表示不限制（默认）。 |
 
 <a id="cn-default-out"></a>
 ### 默认输出文件名（中文）
@@ -279,7 +279,7 @@ video_person_zoom.py INPUT [options]
 | `--target-index` | 0-based index after that ordering (geometry fallback if track+OCR fail). |
 | `--min-iou` | If IoU vs previous box is below this, try OCR re-lock; default `0.2`. |
 | `--ocr-min-conf` | EasyOCR confidence threshold; default `0.15`. |
-| `--max-search-frames` | Max frames from the processing start to obtain the first successful number read; `0` = unlimited; default `2400`. |
+| `--max-search-frames` | Max frames from the processing start to obtain the first successful number read; `0` = unlimited (default). |
 
 <a id="en-default-out"></a>
 ### Default output filenames (English)

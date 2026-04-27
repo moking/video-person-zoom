@@ -75,6 +75,14 @@ Use this format for each new feature entry (append-only):
 - **CLI / API impact**: Added `--parallel-mode`, `--parallel-chunks`, `--chunk-overlap-sec`.
 - **Related optimization**: See [`optimization.md`](./optimization.md).
 
+### FEAT-20260427-4. Unlimited first-lock search by default (`--max-search-frames`)
+- **Date**: 2026-04-27
+- **Scope**: CLI, Tracking
+- **What changed**: `--max-search-frames` default is now `0` (no frame cap until first successful lock); previously `2400`.
+- **Why**: Long videos or late target appearance should not exit early unless the user opts in with a positive limit.
+- **CLI / API impact**: Same flag; default only. Set a positive integer to restore bounded search.
+- **Related optimization**: [EN-17 / ZH-17](./optimization.md#en-17-default-unlimited-first-lock-search-window)
+
 ## 中文条目
 
 ### FEAT-20260426-1. 球袜颜色目标跟拍模式
@@ -100,6 +108,14 @@ Use this format for each new feature entry (append-only):
 - **变更原因**: 在 CPU 主机上加速长视频处理并减少边界漏检。
 - **CLI / API 影响**: 新增 `--parallel-mode`、`--parallel-chunks`、`--chunk-overlap-sec`。
 - **关联优化**: 参见 [`optimization.md`](./optimization.md)。
+
+### FEAT-20260427-4. 首次锁定搜索默认不限制（`--max-search-frames`）
+- **日期**: 2026-04-27
+- **范围**: CLI、跟拍
+- **变更内容**: `--max-search-frames` 默认值由 `2400` 改为 `0`（首次锁定前不限制搜索帧数）。
+- **变更原因**: 长素材或目标较晚出现时不应默认因窗口过短而退出；需要时可显式设正整数。
+- **CLI / API 影响**: 参数不变，仅默认值变化。
+- **关联优化**: [EN-17 / ZH-17](./optimization.md#zh-17-首次锁定搜索窗口默认不限制)
 
 ## Cross Reference
 

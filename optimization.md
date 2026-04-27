@@ -28,6 +28,7 @@ This document lists all new features and optimizations implemented today, focuse
   - [EN-14. Boundary overlap deduplication by absolute timestamps](#en-14-boundary-overlap-deduplication-by-absolute-timestamps)
   - [EN-15. Orange pitch-line rejection for sock color](#en-15-orange-pitch-line-rejection-for-sock-color)
   - [EN-16. Skin-tone exclusion for sock color ratio](#en-16-skin-tone-exclusion-for-sock-color-ratio)
+  - [EN-17. Default unlimited first-lock search window](#en-17-default-unlimited-first-lock-search-window)
   - [Cross Reference to Chinese Section](#cross-reference-to-chinese-section)
 - [CLI 快速参考（中文）](#cli-quick-ref-zh)
 - [中文](#中文)
@@ -47,6 +48,7 @@ This document lists all new features and optimizations implemented today, focuse
   - [ZH-14. overlap 边界结果去重](#zh-14-overlap-边界结果去重)
   - [ZH-15. 橙色目标：球场标线误判抑制](#zh-15-橙色目标球场标线误判抑制)
   - [ZH-16. 肤色排除：降低小腿颜色误判球袜](#zh-16-肤色排除降低小腿颜色误判球袜)
+  - [ZH-17. 首次锁定搜索窗口默认不限制](#zh-17-首次锁定搜索窗口默认不限制)
   - [交叉引用到英文部分](#交叉引用到英文部分)
 
 ---
@@ -71,6 +73,7 @@ This document lists all new features and optimizations implemented today, focuse
 | `--sock-recheck-every-frame` | `on` | `--sock-color` | Per-frame sock recheck to limit tracker drift ([EN-10](#en-10-optional-per-frame-sock-color-recheck-switch)). |
 | `--ball-near-meter` | `1.0` | `-n` or `--sock-color` | Near-ball distance in meters (approx. from bbox scale) ([EN-7](#en-7-configurable-near-ball-distance-threshold)). |
 | `--near-ball-streak-frames` | `2` | `-n` or `--sock-color` | Consecutive frames required before starting a clip ([EN-9](#en-9-consecutive-frame-confirmation-before-triggering-clips)). |
+| `--max-search-frames` | `0` | `-n` or `--sock-color` | Max frames from start to first successful lock; `0` = unlimited (default) ([EN-17](#en-17-default-unlimited-first-lock-search-window)). |
 | `--parallel-mode` | `auto` | Tracking | `auto` / `off` / `force` parallel chunk policy ([EN-12](#en-12-new-parallel-execution-policy-autoffforce)). |
 | `--parallel-chunks` | `0` | Tracking | `0` = derive chunk count from mode + host; `1` = no time-chunk parallelism ([EN-11](#en-11-time-chunk-parallel-processing-with-overlap)). |
 | `--chunk-overlap-sec` | `-1` (auto) | Parallel chunks | `-1` uses one recognition window (~`-d` / segment length) as overlap ([EN-11](#en-11-time-chunk-parallel-processing-with-overlap)). |
@@ -178,10 +181,15 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - **Impact:** Reduces false positives where bare skin is mistaken for sock color (notably orange/yellow/red-like ranges).
 - Works in both strict and relaxed sock modes.
 
+### EN-17. Default unlimited first-lock search window
+- Changed `--max-search-frames` default from `2400` to `0` (unlimited).
+- **Why:** Long clips or late appearances of the target should not abort by default; users can still set a positive cap for faster fail-fast behavior.
+
 ### Cross Reference to Chinese Section
 - Chinese mirror for this section: [Jump to 中文](#中文)
 - CLI quick reference (Chinese): [CLI 快速参考（中文）](#cli-quick-ref-zh)
 - Orange pitch-line guard (Chinese): [ZH-15](#zh-15-橙色目标球场标线误判抑制)
+- First-lock search default unlimited (Chinese): [ZH-17](#zh-17-首次锁定搜索窗口默认不限制)
 
 ---
 
@@ -198,6 +206,7 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 | `--sock-recheck-every-frame` | `on` | `--sock-color` | 逐帧复核袜色，抑制跟丢漂移（[ZH-10](#zh-10-可选逐帧球袜复核开关)）。 |
 | `--ball-near-meter` | `1.0` | `-n` 或 `--sock-color` | 近球距离阈值（米，由框高近似换算）（[ZH-7](#zh-7-可配置近球距离阈值)）。 |
 | `--near-ball-streak-frames` | `2` | `-n` 或 `--sock-color` | 连续满足近球条件后才触发片段（[ZH-9](#zh-9-连续帧确认后再触发片段)）。 |
+| `--max-search-frames` | `0` | `-n` 或 `--sock-color` | 从起点起多少帧内须首次锁定目标；`0` 不限制（默认）（[ZH-17](#zh-17-首次锁定搜索窗口默认不限制)）。 |
 | `--parallel-mode` | `auto` | 跟拍 | `auto` / `off` / `force` 并行策略（[ZH-12](#zh-12-并行策略开关autooffforce)）。 |
 | `--parallel-chunks` | `0` | 跟拍 | `0` 按策略与主机自动分片；`1` 不分片（[ZH-11](#zh-11-时间分片并行处理--overlap)）。 |
 | `--chunk-overlap-sec` | `-1`（自动） | 分片并行 | `-1` 时 overlap 约等于识别窗口长度（与 `-d`/片段时长一致）（[ZH-11](#zh-11-时间分片并行处理--overlap)）。 |
@@ -302,9 +311,14 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - **效果：** 可降低小腿肤色被识别成球袜颜色的误检（对 orange/yellow/red 等更敏感颜色尤为有用）。
 - 严格与宽松球袜模式均生效。
 
+### ZH-17. 首次锁定搜索窗口默认不限制
+- `--max-search-frames` 默认值由 `2400` 改为 `0`（不限制帧数）。
+- **原因：** 长片或目标较晚才出现时，默认不应因搜索窗口过短而直接退出；需要时可显式设为正整数做快速失败。
+
 ### 交叉引用到英文部分
 - 英文镜像内容： [Jump to English](#english)
 - 英文 CLI 快速表：[CLI quick reference (English)](#cli-quick-ref-en)
 - 橙色标线抑制（英文）：[EN-15](#en-15-orange-pitch-line-rejection-for-sock-color)
 - 肤色排除（英文）：[EN-16](#en-16-skin-tone-exclusion-for-sock-color-ratio)
+- 首次锁定搜索默认不限制（英文）：[EN-17](#en-17-default-unlimited-first-lock-search-window)
 

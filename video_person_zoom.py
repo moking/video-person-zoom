@@ -2488,10 +2488,10 @@ def main() -> None:
     p.add_argument(
         "--max-search-frames",
         type=int,
-        default=2400,
+        default=0,
         help=_b(
-            "从处理起点起最多多少帧内须首次识别号码；0 不限制；默认 2400",
-            "Max frames from start to first successful number read; 0 = unlimited; default 2400",
+            "从处理起点起最多多少帧内须首次识别号码；0 不限制（默认）",
+            "Max frames from start to first successful number read; 0 = unlimited (default)",
         ),
     )
     p.add_argument(
