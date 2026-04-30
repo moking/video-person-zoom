@@ -37,6 +37,8 @@ from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 
+WINDOW_ANCHOR_OFFSET_SEC_DEFAULT = 10.0
+
 
 def _configure_quiet_videoio() -> None:
     """Lower FFmpeg/libav log noise (e.g. AV1 HW decode unavailable). / 降低 OpenCV FFmpeg 后端的 stderr 提示。"""
@@ -289,21 +291,22 @@ def _player_near_ball(
     if not ball_boxes:
         return False
     x1, y1, x2, y2 = player_xyxy
-    pw = max(1.0, x2 - x1)
-    ph = max(1.0, y2 - y1)
-    # Approximate meter scale from player height: 1.75m reference adult.
-    meter_px = max(8.0, (ph / 1.75) * max(0.1, float(near_meter)))
+    hx = (x1 + x2) * 0.5
+    hy = y1
+    fx = hx
+    fy = y2
+    # Reference scale from head-to-foot pixel distance.
+    # 以“头到脚”的像素距离作为近球阈值尺度。
+    near_px = max(1.0, float(((fx - hx) ** 2 + (fy - hy) ** 2) ** 0.5))
     for bx1, by1, bx2, by2 in ball_boxes:
-        bcx = (bx1 + bx2) / 2.0
-        bcy = (by1 + by2) / 2.0
-        # Possession-ish: around lower body / feet area.
-        in_possession_zone = (
-            (x1 - 0.15 * pw) <= bcx <= (x2 + 0.15 * pw)
-            and (y1 + 0.45 * ph) <= bcy <= (y2 + 0.18 * ph)
-        )
-        if in_possession_zone:
-            return True
-        if _point_rect_distance_px(bcx, bcy, player_xyxy) <= meter_px:
+        bcx = (bx1 + bx2) * 0.5
+        bcy = (by1 + by2) * 0.5
+        # Distance from ball center to nearest point on player's foot line segment.
+        # 球心到“脚面线段（人框底边）”的最短距离。
+        foot_x = min(max(bcx, x1), x2)
+        foot_y = fy
+        d = float(((bcx - foot_x) ** 2 + (bcy - foot_y) ** 2) ** 0.5)
+        if d <= near_px:
             return True
     return False
 
@@ -374,8 +377,8 @@ def _clip_window_seconds(
     duration_sec: float,
 ) -> tuple[float, float]:
     """
-    Clip window [start,end] centered at center_sec, length duration_sec, clamped to video.
-    以 center 为中心、总长 duration 的窗口，夹在片长内。
+    Clip window [start,end] where -w is anchor time after clip start (default +10s), clamped.
+    以 -w 为“片段起点后锚点时间”（默认 +10 秒）来切窗口，并夹在片长内。
     """
     if video_len_sec <= 0:
         return 0.0, max(0.0, duration_sec)
@@ -383,9 +386,9 @@ def _clip_window_seconds(
         raise ValueError(_b("时长必须大于 0", "Duration must be greater than 0"))
     if duration_sec >= video_len_sec:
         return 0.0, video_len_sec
-    half = duration_sec / 2.0
-    start = center_sec - half
-    end = center_sec + half
+    anchor_after_start = max(0.0, min(float(duration_sec), WINDOW_ANCHOR_OFFSET_SEC_DEFAULT))
+    start = center_sec - anchor_after_start
+    end = start + duration_sec
     if start < 0.0:
         start = 0.0
         end = min(video_len_sec, duration_sec)
@@ -703,8 +706,8 @@ def _clip_segment_start_and_duration(
         vlen = nframes / fps
         start_sec, end_sec = _clip_window_seconds(vlen, c, d)
         return start_sec, end_sec - start_sec
-    half = d / 2.0
-    start_sec = max(0.0, c - half)
+    anchor_after_start = max(0.0, min(d, WINDOW_ANCHOR_OFFSET_SEC_DEFAULT))
+    start_sec = max(0.0, c - anchor_after_start)
     return start_sec, d
 
 
@@ -753,8 +756,8 @@ def _clip_seek_cap(
         clip_n = end_f - start_f
         cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_f))
         return clip_n, start_sec, end_sec
-    half = d / 2.0
-    start_sec = max(0.0, c - half)
+    anchor_after_start = max(0.0, min(d, WINDOW_ANCHOR_OFFSET_SEC_DEFAULT))
+    start_sec = max(0.0, c - anchor_after_start)
     end_sec = start_sec + d
     cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
     clip_n = max(1, int(round(d * fps)))
@@ -1003,6 +1006,30 @@ def _sock_knee_bands_xyxy(
     return (nx1, up_y1, nx2, up_y2), (nx1, dn_y1, nx2, dn_y2)
 
 
+def _sock_shin_band_xyxy(
+    frame_shape: tuple[int, ...],
+    xyxy: tuple[float, float, float, float],
+) -> tuple[int, int, int, int] | None:
+    """
+    Mid-shin confirmation band (below knee) to suppress arm/sleeve confusion.
+    小腿中段确认带（膝下），用于抑制手臂/袖子误判。
+    """
+    fh, fw = int(frame_shape[0]), int(frame_shape[1])
+    x1, y1, x2, y2 = xyxy
+    pw = max(1.0, x2 - x1)
+    ph = max(1.0, y2 - y1)
+    nx1 = max(0, int(x1 + 0.30 * pw))
+    nx2 = min(fw, int(x1 + 0.70 * pw))
+    # Keep band at mid-shin (above shoe area) to avoid shoe-color contamination.
+    cy = y1 + 0.79 * ph
+    hh = max(4.0, ph * (0.040 / 1.75))
+    ny1 = max(0, int(cy - hh))
+    ny2 = min(fh, int(cy + hh))
+    if nx2 <= nx1 + 8 or ny2 <= ny1 + 6:
+        return None
+    return nx1, ny1, nx2, ny2
+
+
 def _sock_color_hsv_ranges(color_name: str) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
     """HSV bounds (OpenCV H:0-179). / 颜色到 HSV 阈值范围。"""
     c = _normalize_sock_color_target(color_name)
@@ -1060,7 +1087,15 @@ def _sock_orange_pitch_line_reject(mask) -> bool:
     return False
 
 
-def _sock_color_match(
+def _sock_strict_min_ratio(color_name: str, user_min_ratio: float) -> float:
+    """Strict per-band threshold with color-aware floor. / 严格模式每带阈值（颜色感知下限）。"""
+    c = _normalize_sock_color_target(color_name)
+    # White/black socks are more sensitive to exposure/compression noise; use a slightly lower floor.
+    floor = 0.24 if c in {"white", "black"} else 0.30
+    return max(float(user_min_ratio), floor)
+
+
+def _sock_color_match_core(
     frame_bgr,
     xyxy: tuple[float, float, float, float],
     color_name: str,
@@ -1138,16 +1173,39 @@ def _sock_color_match(
         bands = _sock_knee_bands_xyxy(frame_bgr.shape, xyxy)
         if bands is None:
             return False
-        strict_ratio = max(float(min_ratio), 0.30)
+        strict_ratio = _sock_strict_min_ratio(cnorm, float(min_ratio))
         um, upper_ratio = _roi_mask_ratio(bands[0])
-        if upper_ratio < strict_ratio:
-            return False
+        upper_ok = upper_ratio >= strict_ratio
         if use_line_guard and um is not None and _sock_orange_pitch_line_reject(um):
             return False
         lm, lower_ratio = _roi_mask_ratio(bands[1])
-        if lower_ratio < strict_ratio:
-            return False
+        lower_ok = lower_ratio >= strict_ratio
         if use_line_guard and lm is not None and _sock_orange_pitch_line_reject(lm):
+            return False
+        strict_hit = upper_ok and lower_ok
+        # Partial-occlusion fallback: one band passes, the other is close, and merged knee ROI still passes.
+        one_ok = upper_ok ^ lower_ok
+        weak_ratio = lower_ratio if upper_ok else upper_ratio
+        if (not strict_hit) and one_ok and weak_ratio >= strict_ratio * 0.58:
+            roi = _sock_roi_xyxy(frame_bgr.shape, xyxy)
+            if roi is not None:
+                m, r = _roi_mask_ratio(roi)
+                fallback_ratio = max(float(min_ratio), strict_ratio * 0.72)
+                if r >= fallback_ratio:
+                    if use_line_guard and m is not None and _sock_orange_pitch_line_reject(m):
+                        return False
+                    strict_hit = True
+        if not strict_hit:
+            return False
+        # Add shin confirmation to avoid sleeve/arm confusion near knee height.
+        shin = _sock_shin_band_xyxy(frame_bgr.shape, xyxy)
+        if shin is None:
+            return False
+        sm, sr = _roi_mask_ratio(shin)
+        shin_ratio = max(0.12, strict_ratio * 0.52)
+        if sr < shin_ratio:
+            return False
+        if use_line_guard and sm is not None and _sock_orange_pitch_line_reject(sm):
             return False
         return True
 
@@ -1160,10 +1218,96 @@ def _sock_color_match(
         return False
     if use_line_guard and m is not None and _sock_orange_pitch_line_reject(m):
         return False
+    shin = _sock_shin_band_xyxy(frame_bgr.shape, xyxy)
+    if shin is None:
+        return False
+    sm, sr = _roi_mask_ratio(shin)
+    shin_ratio = max(0.10, float(min_ratio) * 0.58)
+    if sr < shin_ratio:
+        return False
+    if use_line_guard and sm is not None and _sock_orange_pitch_line_reject(sm):
+        return False
     return True
 
 
-def _ocr_jersey_match(
+def _focused_zoom_verify_patch(
+    frame_bgr,
+    xyxy: tuple[float, float, float, float],
+    *,
+    focus: str,
+    zoom: float = 2.0,
+) -> tuple[object, tuple[float, float, float, float]] | None:
+    """Build enlarged local patch focused on jersey/sock area, while keeping full player box."""
+    fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    x1, y1, x2, y2 = xyxy
+    pw = max(2.0, x2 - x1)
+    ph = max(2.0, y2 - y1)
+    cx = (x1 + x2) * 0.5
+    if focus == "sock":
+        cy = y1 + 0.76 * ph
+    elif focus == "jersey":
+        cy = y1 + 0.30 * ph
+    else:
+        cy = (y1 + y2) * 0.5
+    w2 = 0.5 * pw * max(1.2, float(zoom))
+    h2 = 0.5 * ph * max(1.2, float(zoom))
+    px1 = int(cx - w2)
+    py1 = int(cy - h2)
+    px2 = int(cx + w2)
+    py2 = int(cy + h2)
+    # Ensure focused patch still contains full player box to keep ROI geometry stable.
+    pad_w = int(max(2.0, 0.04 * pw))
+    pad_h = int(max(2.0, 0.04 * ph))
+    px1 = min(px1, int(x1) - pad_w)
+    py1 = min(py1, int(y1) - pad_h)
+    px2 = max(px2, int(x2) + pad_w)
+    py2 = max(py2, int(y2) + pad_h)
+    px1 = max(0, px1)
+    py1 = max(0, py1)
+    px2 = min(fw, px2)
+    py2 = min(fh, py2)
+    if px2 <= px1 + 12 or py2 <= py1 + 12:
+        return None
+    patch = frame_bgr[py1:py2, px1:px2]
+    local = (x1 - px1, y1 - py1, x2 - px1, y2 - py1)
+    return patch, local
+
+
+def _sock_color_match(
+    frame_bgr,
+    xyxy: tuple[float, float, float, float],
+    color_name: str,
+    min_ratio: float,
+    strict_mode: bool,
+    skin_exclude: bool | str = True,
+) -> bool:
+    # Pass 1: normal-scale match.
+    if not _sock_color_match_core(
+        frame_bgr,
+        xyxy,
+        color_name,
+        min_ratio,
+        strict_mode,
+        skin_exclude,
+    ):
+        return False
+    # Pass 2: zoom-in verification around candidate player to reduce false positives.
+    zoom_pack = _focused_zoom_verify_patch(frame_bgr, xyxy, focus="sock", zoom=2.0)
+    if zoom_pack is None:
+        return False
+    patch, local_box = zoom_pack
+    verify_ratio = min(0.95, max(float(min_ratio), float(min_ratio) + 0.01))
+    return _sock_color_match_core(
+        patch,
+        local_box,
+        color_name,
+        verify_ratio,
+        strict_mode,
+        skin_exclude,
+    )
+
+
+def _ocr_jersey_match_core(
     reader,
     frame_bgr,
     xyxy: tuple[float, float, float, float],
@@ -1207,6 +1351,25 @@ def _ocr_jersey_match(
             continue
         texts.append(tx)
     return _ocr_text_matches_target(texts, target)
+
+
+def _ocr_jersey_match(
+    reader,
+    frame_bgr,
+    xyxy: tuple[float, float, float, float],
+    target: str,
+    min_conf: float,
+) -> bool:
+    # Pass 1: normal-scale OCR match.
+    if not _ocr_jersey_match_core(reader, frame_bgr, xyxy, target, min_conf):
+        return False
+    # Pass 2: zoom-in local verification around player bbox.
+    zoom_pack = _focused_zoom_verify_patch(frame_bgr, xyxy, focus="jersey", zoom=2.0)
+    if zoom_pack is None:
+        return False
+    patch, local_box = zoom_pack
+    verify_conf = min(1.0, max(0.01, float(min_conf) + 0.03))
+    return _ocr_jersey_match_core(reader, patch, local_box, target, verify_conf)
 
 
 def _find_box_by_jersey_scan(
@@ -1453,6 +1616,13 @@ def process_video(
     ball_near_meter: float,
     near_ball_streak_frames: int,
     sock_recheck_every_frame: bool,
+    sock_match_frame_limit: int,
+    miss_skip_seconds: float,
+    ball_missing_grace_frames: int,
+    shot_relax_window_sec: float,
+    shot_relax_sock_delta: float,
+    shot_relax_ocr_delta: float,
+    segment_extend_sec: float,
     segment_name_prefix: str = "",
     segment_time_offset_sec: float = 0.0,
 ) -> list[str]:
@@ -1642,9 +1812,9 @@ def process_video(
             print(
                 _b(
                     f"输出片段: 约 {start_sec_print:.3f}s – {end_sec_print:.3f}s，"
-                    f"共 {clip_frames_total} 帧（-w 中心 -d 总长）。",
+                    f"共 {clip_frames_total} 帧（-w=片段起点后 10s，默认）。",
                     f"Output clip: ~{start_sec_print:.3f}s – {end_sec_print:.3f}s, "
-                    f"{clip_frames_total} frames (-w center, -d duration).",
+                    f"{clip_frames_total} frames (-w is default +10s from clip start).",
                 ),
                 file=sys.stderr,
             )
@@ -1673,6 +1843,21 @@ def process_video(
     next_segment_detect_sec = 0.0
     recent_out_frames: deque = deque(maxlen=max(1, pre_roll_frames + 1))
     near_ball_streak = 0
+    required_near_ball_streak = 1 if use_sock_color else max(1, int(near_ball_streak_frames))
+    saved_sock_frames = 0
+    sock_frames_dir = ""
+    if use_sock_color and int(sock_match_frame_limit) > 0:
+        base_dir = os.path.dirname(output_path) or os.getcwd()
+        base_stem = Path(output_path).stem
+        sock_frames_dir = os.path.join(base_dir, f"{base_stem}_sock_frames")
+        os.makedirs(sock_frames_dir, exist_ok=True)
+        print(
+            _b(
+                f"球袜命中帧导出已开启：最多保存 {int(sock_match_frame_limit)} 帧，目录 {sock_frames_dir}",
+                f"Sock-match frame export enabled: up to {int(sock_match_frame_limit)} frames, dir {sock_frames_dir}",
+            ),
+            file=sys.stderr,
+        )
 
     model = YOLO(model_name)
     infer_device = _normalize_yolo_device(device, cuda_ok=cuda_ok)
@@ -1688,10 +1873,11 @@ def process_video(
     )
     if use_sock_color:
         if sock_strict_mode:
+            strict_ratio_dbg = _sock_strict_min_ratio(sock_color or "", float(sock_min_ratio))
             print(
                 _b(
-                    f"球袜检测标准: 严格模式（膝上5cm+膝下5cm 双带都需命中），颜色={sock_color}，每带最小占比=max(--sock-min-ratio, 0.30)={max(float(sock_min_ratio), 0.30):.2f}。",
-                    f"Sock detection standard: STRICT (both knee-5cm and knee+5cm bands must match), color={sock_color}, min ratio per band=max(--sock-min-ratio, 0.30)={max(float(sock_min_ratio), 0.30):.2f}.",
+                    f"球袜检测标准: 严格模式（膝上5cm+膝下5cm 双带都需命中），颜色={sock_color}，每带最小占比={strict_ratio_dbg:.2f}（白/黑色下限更宽松）；并启用单带接近阈值时的补偿判定。",
+                    f"Sock detection standard: STRICT (both knee-5cm and knee+5cm bands must match), color={sock_color}, min ratio per band={strict_ratio_dbg:.2f} (slightly lower floor for white/black), plus partial-band fallback.",
                 ),
                 file=sys.stderr,
             )
@@ -1712,8 +1898,8 @@ def process_video(
         )
         print(
             _b(
-                f"近球触发标准: 连续 {max(1, int(near_ball_streak_frames))} 帧满足“目标有效且球员在球周围 {float(ball_near_meter):.2f} 米内/持球”才触发片段。",
-                f"Near-ball trigger standard: start segment only after {max(1, int(near_ball_streak_frames))} consecutive frames where target is valid and within {float(ball_near_meter):.2f}m of ball/has possession.",
+                f"近球触发标准: 连续 {required_near_ball_streak} 帧满足“目标有效且球员在球周围 {float(ball_near_meter):.2f} 米内/持球”才触发片段（袜色模式默认单帧即触发）。",
+                f"Near-ball trigger standard: start segment after {required_near_ball_streak} consecutive frame(s) where target is valid and within {float(ball_near_meter):.2f}m of ball/has possession (sock-color mode defaults to single-frame trigger).",
             ),
             file=sys.stderr,
         )
@@ -1733,6 +1919,13 @@ def process_video(
     lock_announced = False
     frame_i = 0
     progress_total = clip_frames_total if clip_frames_total is not None else nframes
+    miss_skip_frames = max(0, int(round(max(0.0, float(miss_skip_seconds)) * max(fps, 1e-6))))
+    shot_relax_window_frames = max(
+        0, int(round(max(0.0, float(shot_relax_window_sec)) * max(fps, 1e-6)))
+    )
+    segment_extend_frames = max(0, int(round(max(0.0, float(segment_extend_sec)) * max(fps, 1e-6))))
+    shot_relax_left = 0
+    ball_missing_left = 0
 
     def _write_full_and_maybe_abort() -> None:
         """Before first lock: keep scanning only; no output. / 首次锁定前只扫描，不写输出。"""
@@ -1774,6 +1967,22 @@ def process_video(
                 )
             )
 
+    def _skip_after_miss() -> None:
+        """After a miss, skip next N-1 frames to reduce detector calls."""
+        nonlocal frame_i
+        if miss_skip_frames <= 1:
+            return
+        to_skip = miss_skip_frames - 1
+        skipped = 0
+        while skipped < to_skip:
+            if clip_frames_total is not None and frame_i >= clip_frames_total:
+                break
+            ok = cap.grab()
+            if not ok:
+                break
+            frame_i += 1
+            skipped += 1
+
     try:
         while True:
             if clip_frames_total is not None and frame_i >= clip_frames_total:
@@ -1787,6 +1996,16 @@ def process_video(
 
             box: tuple[float, float, float, float] | None = None
             target_valid_this_frame = False
+            in_shot_relax_window = shot_relax_left > 0
+            ocr_min_conf_cur = max(
+                0.01,
+                float(ocr_min_conf) - (float(shot_relax_ocr_delta) if in_shot_relax_window else 0.0),
+            )
+            sock_min_ratio_cur = max(
+                0.0,
+                float(sock_min_ratio)
+                - (float(shot_relax_sock_delta) if in_shot_relax_window else 0.0),
+            )
             results = model.predict(
                 frame,
                 classes=[0, 32],
@@ -1815,7 +2034,7 @@ def process_video(
                                 persons,
                                 locked_ref_xyxy,
                                 jersey,
-                                ocr_min_conf,
+                                ocr_min_conf_cur,
                             )
                         elif use_sock_color and sock_color is not None:
                             relock_hit = _relock_by_sock_color(
@@ -1823,7 +2042,7 @@ def process_video(
                                 persons,
                                 locked_ref_xyxy,
                                 sock_color,
-                                sock_min_ratio,
+                                sock_min_ratio_cur,
                                 sock_strict_mode,
                                 sock_skin_exclude,
                             )
@@ -1874,19 +2093,20 @@ def process_video(
                     init_hit = None
                     if use_jersey and ocr_reader is not None and jersey is not None:
                         init_hit = _find_box_by_jersey_scan(
-                            ocr_reader, frame, persons, jersey, ocr_min_conf
+                            ocr_reader, frame, persons, jersey, ocr_min_conf_cur
                         )
                     elif use_sock_color and sock_color is not None:
                         init_hit = _find_box_by_sock_color_scan(
                             frame,
                             persons,
                             sock_color,
-                            sock_min_ratio,
+                            sock_min_ratio_cur,
                             sock_strict_mode,
                             sock_skin_exclude,
                         )
                     if init_hit is None:
                         _write_full_and_maybe_abort()
+                        _skip_after_miss()
                         continue
                     box = init_hit
                     target_valid_this_frame = True
@@ -1912,6 +2132,7 @@ def process_video(
                 box = last_box
             else:
                 _write_full_and_maybe_abort()
+                _skip_after_miss()
                 continue
 
             # In sock-color mode, continuously verify current target to prevent drift.
@@ -1926,7 +2147,7 @@ def process_video(
                         frame,
                         box,
                         sock_color,
-                        sock_min_ratio,
+                        sock_min_ratio_cur,
                         sock_strict_mode,
                         sock_skin_exclude,
                     )
@@ -1939,9 +2160,35 @@ def process_video(
                 last_box = box
 
             x1, y1, x2, y2 = box
-            near_ball_this_frame = bool(target_valid_this_frame) and _player_near_ball(
-                box, balls, ball_near_meter
-            )
+            near_ball_raw = bool(target_valid_this_frame) and _player_near_ball(box, balls, ball_near_meter)
+            if near_ball_raw:
+                near_ball_this_frame = True
+                ball_missing_left = max(0, int(ball_missing_grace_frames))
+            elif bool(target_valid_this_frame) and (not balls) and ball_missing_left > 0:
+                near_ball_this_frame = True
+                ball_missing_left -= 1
+            else:
+                near_ball_this_frame = False
+                ball_missing_left = 0
+            if (
+                int(sock_match_frame_limit) > 0
+                and saved_sock_frames < int(sock_match_frame_limit)
+                and target_valid_this_frame
+                and near_ball_this_frame
+            ):
+                marked = frame.copy()
+                cv2.rectangle(
+                    marked,
+                    (int(round(x1)), int(round(y1))),
+                    (int(round(x2)), int(round(y2))),
+                    (0, 255, 255),
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
+                saved_sock_frames += 1
+                dump_name = f"target-match-nearball-{saved_sock_frames:04d}-f{frame_i:06d}.jpg"
+                dump_path = os.path.join(sock_frames_dir, dump_name)
+                cv2.imwrite(dump_path, marked)
             if near_ball_this_frame:
                 near_ball_streak += 1
             else:
@@ -1969,6 +2216,26 @@ def process_video(
 
             crop = frame[iy1:iy2, ix1:ix2]
             out = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+            # Draw target player bounding box in output for continuous verification.
+            crop_w = max(1.0, float(ix2 - ix1))
+            crop_h = max(1.0, float(iy2 - iy1))
+            # Draw using smoothed tracking box so overlay stays in sync with camera motion.
+            box_x1 = int(round(((float(hx1) - float(ix1)) / crop_w) * float(out_w)))
+            box_y1 = int(round(((float(hy1) - float(iy1)) / crop_h) * float(out_h)))
+            box_x2 = int(round(((float(hx2) - float(ix1)) / crop_w) * float(out_w)))
+            box_y2 = int(round(((float(hy2) - float(iy1)) / crop_h) * float(out_h)))
+            box_x1 = max(0, min(box_x1, out_w - 1))
+            box_y1 = max(0, min(box_y1, out_h - 1))
+            box_x2 = max(box_x1 + 1, min(box_x2, out_w))
+            box_y2 = max(box_y1 + 1, min(box_y2, out_h))
+            cv2.rectangle(
+                out,
+                (box_x1, box_y1),
+                (box_x2, box_y2),
+                (0, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
             recent_out_frames.append(out)
             still_active: list[dict[str, object]] = []
             for seg in active_segments:
@@ -1981,6 +2248,10 @@ def process_video(
                     else:
                         sw.write(out)
                         rem -= 1
+                        ext_budget = int(seg.get("extend_budget", 0))
+                        if near_ball_this_frame and ext_budget > 0:
+                            rem += 1
+                            seg["extend_budget"] = ext_budget - 1
                     if rem <= 0:
                         sw.close()
                         saved_segments.append(pth)
@@ -1995,8 +2266,8 @@ def process_video(
                         seg["remaining"] = rem
                         still_active.append(seg)
             active_segments = still_active
-            # Require consecutive confirmations to avoid one-frame false triggers.
-            if near_ball_streak >= max(1, int(near_ball_streak_frames)):
+            # In sock-color mode, two-pass sock verification allows single-frame trigger.
+            if near_ball_streak >= required_near_ball_streak:
                 detect_t = max(0.0, (frame_i - 1) / max(fps, 1e-6))
                 can_start = True
                 if detect_t < next_segment_detect_sec:
@@ -2055,6 +2326,7 @@ def process_video(
                                     "remaining": rem,
                                     "path": segment_path,
                                     "skip_once": True,
+                                    "extend_budget": segment_extend_frames,
                                 }
                             )
                             print(
@@ -2075,6 +2347,10 @@ def process_video(
                         )
             if max_segments > 0 and len(saved_segments) >= max_segments:
                 break
+            if near_ball_this_frame:
+                shot_relax_left = shot_relax_window_frames
+            else:
+                shot_relax_left = max(0, shot_relax_left - 1)
 
             if clip_frames_total is not None:
                 if clip_frames_total and frame_i % max(1, clip_frames_total // 20) == 0:
@@ -2501,8 +2777,8 @@ def main() -> None:
         default=None,
         metavar="TIME",
         help=_b(
-            "片段中心时间（秒或 MM:SS / H:MM:SS）；须与 -d 同用",
-            "Clip center time; use with -d",
+            "片段锚点时间（秒或 MM:SS / H:MM:SS）；默认表示片段开始后 10 秒；须与 -d 同用",
+            "Clip anchor time; defaults to 10s after clip start; use with -d",
         ),
     )
     p.add_argument(
@@ -2589,12 +2865,75 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--skip-seconds-on-miss",
+        type=float,
+        default=0.05,
+        help=_b(
+            "仅跟拍模式：当前帧未识别到目标时跳过的秒数（默认 0.05，0=关闭）",
+            "Tracking only: seconds to skip when current frame misses target (default 0.05, 0=off)",
+        ),
+    )
+    p.add_argument(
+        "--ball-missing-grace-frames",
+        type=int,
+        default=2,
+        help=_b(
+            "仅跟拍模式：近球状态下允许连续多少帧无球检测仍判近球，默认 2",
+            "Tracking only: near-ball grace frames allowed when ball detection is missing, default 2",
+        ),
+    )
+    p.add_argument(
+        "--shot-relax-window-sec",
+        type=float,
+        default=0.8,
+        help=_b(
+            "仅跟拍模式：射门候选窗口秒数，在该窗口内放宽二次复核阈值，默认 0.8",
+            "Tracking only: shot-candidate window seconds for relaxed second-pass checks, default 0.8",
+        ),
+    )
+    p.add_argument(
+        "--shot-relax-sock-delta",
+        type=float,
+        default=0.03,
+        help=_b(
+            "仅跟拍模式：射门候选窗口内袜色阈值下调量，默认 0.03",
+            "Tracking only: sock ratio reduction inside shot-candidate window, default 0.03",
+        ),
+    )
+    p.add_argument(
+        "--shot-relax-ocr-delta",
+        type=float,
+        default=0.03,
+        help=_b(
+            "仅跟拍模式：射门候选窗口内 OCR 置信阈值下调量，默认 0.03",
+            "Tracking only: OCR confidence reduction inside shot-candidate window, default 0.03",
+        ),
+    )
+    p.add_argument(
+        "--segment-extend-sec",
+        type=float,
+        default=1.2,
+        help=_b(
+            "仅跟拍模式：触发后可按近球状态连续延长片段的秒数预算，默认 1.2",
+            "Tracking only: post-trigger segment extension budget seconds while near-ball persists, default 1.2",
+        ),
+    )
+    p.add_argument(
         "--sock-recheck-every-frame",
         choices=("on", "off"),
         default="on",
         help=_b(
             "仅 --sock-color：是否逐帧复核当前目标仍为目标袜色（on 更稳，off 更宽松）",
             "Only with --sock-color: whether to recheck target sock color every frame (on is safer, off is looser)",
+        ),
+    )
+    p.add_argument(
+        "--sock-save-frames",
+        type=int,
+        default=0,
+        help=_b(
+            "仅 --sock-color：额外保存满足袜色条件的帧为 JPG；值为最多保存张数，0=不保存",
+            "Only with --sock-color: save sock-match frames as JPG; value is max frame count, 0=off",
         ),
     )
     args = p.parse_args()
@@ -2637,6 +2976,25 @@ def main() -> None:
                 "--near-ball-streak-frames must be > 0",
             )
         )
+    if args.skip_seconds_on_miss < 0:
+        p.error(_b("--skip-seconds-on-miss 不能为负数", "--skip-seconds-on-miss must be >= 0"))
+    if args.ball_missing_grace_frames < 0:
+        p.error(
+            _b(
+                "--ball-missing-grace-frames 不能为负数",
+                "--ball-missing-grace-frames must be >= 0",
+            )
+        )
+    if args.shot_relax_window_sec < 0:
+        p.error(_b("--shot-relax-window-sec 不能为负数", "--shot-relax-window-sec must be >= 0"))
+    if args.shot_relax_sock_delta < 0:
+        p.error(_b("--shot-relax-sock-delta 不能为负数", "--shot-relax-sock-delta must be >= 0"))
+    if args.shot_relax_ocr_delta < 0:
+        p.error(_b("--shot-relax-ocr-delta 不能为负数", "--shot-relax-ocr-delta must be >= 0"))
+    if args.segment_extend_sec < 0:
+        p.error(_b("--segment-extend-sec 不能为负数", "--segment-extend-sec must be >= 0"))
+    if args.sock_save_frames < 0:
+        p.error(_b("--sock-save-frames 不能为负数", "--sock-save-frames must be >= 0"))
     sock_strict_mode = str(args.sock_strict_mode).strip().lower() != "off"
     sock_skin_exclude = str(args.sock_skin_exclude).strip().lower()
     sock_recheck_every_frame = str(args.sock_recheck_every_frame).strip().lower() != "off"
@@ -2847,6 +3205,13 @@ def main() -> None:
                 "ball_near_meter": float(args.ball_near_meter),
                 "near_ball_streak_frames": int(args.near_ball_streak_frames),
                 "sock_recheck_every_frame": sock_recheck_every_frame,
+                "sock_match_frame_limit": int(args.sock_save_frames),
+                "miss_skip_seconds": float(args.skip_seconds_on_miss),
+                "ball_missing_grace_frames": int(args.ball_missing_grace_frames),
+                "shot_relax_window_sec": float(args.shot_relax_window_sec),
+                "shot_relax_sock_delta": float(args.shot_relax_sock_delta),
+                "shot_relax_ocr_delta": float(args.shot_relax_ocr_delta),
+                "segment_extend_sec": float(args.segment_extend_sec),
             }
             parallel_mode = str(args.parallel_mode).strip().lower()
             req_chunks = int(args.parallel_chunks)

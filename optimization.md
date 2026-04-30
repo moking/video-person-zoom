@@ -29,6 +29,16 @@ This document lists all new features and optimizations implemented today, focuse
   - [EN-15. Orange pitch-line rejection for sock color](#en-15-orange-pitch-line-rejection-for-sock-color)
   - [EN-16. Skin-tone exclusion for sock color ratio](#en-16-skin-tone-exclusion-for-sock-color-ratio)
   - [EN-17. Default unlimited first-lock search window](#en-17-default-unlimited-first-lock-search-window)
+  - [EN-18. Sock-color recall hardening for strict mode](#en-18-sock-color-recall-hardening-for-strict-mode)
+  - [EN-19. Near-ball gating made more tolerant](#en-19-near-ball-gating-made-more-tolerant)
+  - [EN-20. Zoom-in secondary verification for sock-color hits](#en-20-zoom-in-secondary-verification-for-sock-color-hits)
+  - [EN-21. Single-frame trigger in sock-color mode](#en-21-single-frame-trigger-in-sock-color-mode)
+  - [EN-22. Two-pass verification for jersey-number matching](#en-22-two-pass-verification-for-jersey-number-matching)
+  - [EN-23. Shin-band confirmation to suppress arm-as-leg false hits](#en-23-shin-band-confirmation-to-suppress-arm-as-leg-false-hits)
+  - [EN-24. Miss-based temporal skipping for faster scanning](#en-24-miss-based-temporal-skipping-for-faster-scanning)
+  - [EN-25. Target-focused zoom verification and softer miss-skip default](#en-25-target-focused-zoom-verification-and-softer-miss-skip-default)
+  - [EN-26. Height-based near-ball rule and box-only overlays](#en-26-height-based-near-ball-rule-and-box-only-overlays)
+  - [EN-27. Shot-priority recall window and segment continuation](#en-27-shot-priority-recall-window-and-segment-continuation)
   - [Cross Reference to Chinese Section](#cross-reference-to-chinese-section)
 - [CLI 快速参考（中文）](#cli-quick-ref-zh)
 - [中文](#中文)
@@ -49,6 +59,16 @@ This document lists all new features and optimizations implemented today, focuse
   - [ZH-15. 橙色目标：球场标线误判抑制](#zh-15-橙色目标球场标线误判抑制)
   - [ZH-16. 肤色排除：降低小腿颜色误判球袜](#zh-16-肤色排除降低小腿颜色误判球袜)
   - [ZH-17. 首次锁定搜索窗口默认不限制](#zh-17-首次锁定搜索窗口默认不限制)
+  - [ZH-18. 严格模式球袜召回增强（降低漏检）](#zh-18-严格模式球袜召回增强降低漏检)
+  - [ZH-19. 近球门控判定放宽（降低漏触发）](#zh-19-近球门控判定放宽降低漏触发)
+  - [ZH-20. 球袜命中增加放大二次校验（降低误检）](#zh-20-球袜命中增加放大二次校验降低误检)
+  - [ZH-21. 袜色模式改为单帧触发（降低漏触发）](#zh-21-袜色模式改为单帧触发降低漏触发)
+  - [ZH-22. 号码识别改为两阶段校验（降低误检）](#zh-22-号码识别改为两阶段校验降低误检)
+  - [ZH-23. 增加小腿确认带，抑制“手臂当腿”误检](#zh-23-增加小腿确认带抑制手臂当腿误检)
+  - [ZH-24. 未命中时按秒跳帧，加速扫描](#zh-24-未命中时按秒跳帧加速扫描)
+  - [ZH-25. 聚焦目标区域放大复核，并下调默认跳帧](#zh-25-聚焦目标区域放大复核并下调默认跳帧)
+  - [ZH-26. 近球改为“球距不超过身高”并统一框标注](#zh-26-近球改为球距不超过身高并统一框标注)
+  - [ZH-27. 射门优先召回窗口与片段连续扩展](#zh-27-射门优先召回窗口与片段连续扩展)
   - [交叉引用到英文部分](#交叉引用到英文部分)
 
 ---
@@ -185,11 +205,88 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - Changed `--max-search-frames` default from `2400` to `0` (unlimited).
 - **Why:** Long clips or late appearances of the target should not abort by default; users can still set a positive cap for faster fail-fast behavior.
 
+### EN-18. Sock-color recall hardening for strict mode
+- **Problem:** In strict dual-band mode, some target sock colors (especially white/black under compression or exposure shifts) can be under-counted in one band and cause false negatives.
+- **Mitigation:**
+  - Added color-aware strict per-band floor: white/black now use a lower floor (`0.24`), while other colors keep `0.30` (still bounded by `--sock-min-ratio`).
+  - Added conservative partial-band fallback: if one knee band passes and the other is close, accept only when the merged knee ROI also passes a guarded ratio check.
+- **Impact:** Improves recall for hard sock-color scenes while keeping anti-false-positive guards (orange line rejection and ratio gating) active.
+
+### EN-19. Near-ball gating made more tolerant
+- **Problem:** Near-ball gating could be too strict in practice, making segment triggers hard when ball boxes jitter, are tiny, or player scale is far-field.
+- **Mitigation:**
+  - Relaxed meter-to-pixel mapping using a wider body scale (`max(height, 1.25*width)`) and a larger tolerance factor.
+  - Expanded possession zone around lower body/feet.
+  - Switched from center-only distance to nearest-point distance from ball box to player box, with extra margin from ball radius and player width.
+- **Impact:** Easier near-ball satisfaction and better trigger recall while still requiring target validity plus streak confirmation.
+
+### EN-20. Zoom-in secondary verification for sock-color hits
+- **Problem:** Some false positives can still pass at original scale when target socks are small/noisy in frame.
+- **Mitigation:** Added a two-pass sock-color decision:
+  - Pass 1: normal-scale match (existing logic).
+  - Pass 2: zoom-in local patch around the candidate player and re-check sock-color with a slightly stricter ratio.
+- **Impact:** Candidate frames must pass both checks, which suppresses non-target players that accidentally pass coarse-scale color checks.
+
+### EN-21. Single-frame trigger in sock-color mode
+- **Change:** In `--sock-color` mode, near-ball trigger now defaults to single-frame confirmation once the frame passes sock-color verification and near-ball check.
+- **Why:** With two-pass sock-color verification enabled, requiring two consecutive frames became unnecessarily strict and caused missed triggers.
+- **Impact:** Sock-color workflow starts clips faster on valid hits while still guarded by color verification and ball proximity.
+
+### EN-22. Two-pass verification for jersey-number matching
+- **Change:** Jersey-number matching now uses the same two-pass confirmation pattern as sock-color matching.
+- **Mitigation:** Candidate player must pass:
+  - Pass 1: normal-scale OCR number match.
+  - Pass 2: zoom-in local OCR re-check around the same player box with slightly stricter confidence.
+- **Impact:** Reduces false locks where coarse-scale OCR accidentally reads a wrong player as target number.
+
+### EN-23. Shin-band confirmation to suppress arm-as-leg false hits
+- **Problem:** In some frames, arm/sleeve colors near knee-height could be mistaken as sock-color hits.
+- **Mitigation:** Added a lower-leg (mid-shin) confirmation band; a candidate now needs color support in shin area as well, not only knee-centered bands/ROI.
+- **Impact:** Reduces false positives where upper-limb colors are misclassified as leg/sock evidence.
+
+### EN-24. Miss-based temporal skipping for faster scanning
+- **Change:** Added `--skip-seconds-on-miss` (default `0.05`) in tracking modes.
+- **Behavior:** When current frame misses target lock, the pipeline skips approximately the configured seconds worth of subsequent frames before running next full detection pass.
+- **Impact:** Reduces detector invocations and speeds up long-footage scanning; set `0` to disable skipping.
+
+### EN-25. Target-focused zoom verification and softer miss-skip default
+- **Problem:** Global player-centered zoom verification could still include distracting regions; aggressive miss-skip could reduce recall.
+- **Mitigation:**
+  - Second-pass zoom now focuses by task: jersey mode centers on torso/number region; sock mode centers on lower-leg/sock region, while still containing full player box for stable geometry.
+  - Sock second-pass ratio bump reduced from `+0.03` to `+0.01` to avoid over-pruning true positives.
+  - Shin confirmation band shifted upward to reduce shoe-color contamination.
+  - Miss-skip default lowered to `0.2s` (from `1.0s`) for better recall/throughput balance.
+  - Miss-skip default further lowered to `0.05s` to reduce missed short shooting moments.
+- **Impact:** Better precision on true target regions with improved recall stability and fewer shoe-as-sock artifacts.
+
+### EN-26. Height-based near-ball rule and box-only overlays
+- **Change:** Near-ball decision now accepts candidate when ball-player distance is less than or equal to player height (in pixels).
+- **Refinement:** Distance is measured from ball center to nearest point on player's foot line (bottom edge of player box), and threshold uses head-to-foot pixel distance.
+- **Visual update:** Removed head-circle marker; exported verification frames and output segments now use target bounding box overlay consistently.
+- **Impact:** Aligns near-ball semantics with requested rule-of-thumb and improves visual verification consistency during playback.
+
+### EN-27. Shot-priority recall window and segment continuation
+- **Change:** Added shot-priority recall controls:
+  - `--ball-missing-grace-frames` to tolerate 1-2 brief frames without ball detection while preserving near-ball state.
+  - `--shot-relax-window-sec` with `--shot-relax-sock-delta` / `--shot-relax-ocr-delta` to slightly relax second-pass verification thresholds in a short shot-candidate window.
+  - `--segment-extend-sec` to allow active segments to continue briefly while near-ball persists after trigger.
+- **Impact:** Improves capture of short shooting actions under ball-detection flicker and avoids clip fragmentation around trigger boundaries.
+
 ### Cross Reference to Chinese Section
 - Chinese mirror for this section: [Jump to 中文](#中文)
 - CLI quick reference (Chinese): [CLI 快速参考（中文）](#cli-quick-ref-zh)
 - Orange pitch-line guard (Chinese): [ZH-15](#zh-15-橙色目标球场标线误判抑制)
 - First-lock search default unlimited (Chinese): [ZH-17](#zh-17-首次锁定搜索窗口默认不限制)
+- Strict-mode sock recall hardening (Chinese): [ZH-18](#zh-18-严格模式球袜召回增强降低漏检)
+- Near-ball gating tolerance increase (Chinese): [ZH-19](#zh-19-近球门控判定放宽降低漏触发)
+- Zoom-in secondary sock verification (Chinese): [ZH-20](#zh-20-球袜命中增加放大二次校验降低误检)
+- Single-frame sock trigger (Chinese): [ZH-21](#zh-21-袜色模式改为单帧触发降低漏触发)
+- Two-pass jersey verification (Chinese): [ZH-22](#zh-22-号码识别改为两阶段校验降低误检)
+- Shin-band anti arm confusion (Chinese): [ZH-23](#zh-23-增加小腿确认带抑制手臂当腿误检)
+- Miss-based skip acceleration (Chinese): [ZH-24](#zh-24-未命中时按秒跳帧加速扫描)
+- Target-focused zoom and softer skip default (Chinese): [ZH-25](#zh-25-聚焦目标区域放大复核并下调默认跳帧)
+- Height-based near-ball and box overlay (Chinese): [ZH-26](#zh-26-近球改为球距不超过身高并统一框标注)
+- Shot-priority recall window (Chinese): [ZH-27](#zh-27-射门优先召回窗口与片段连续扩展)
 
 ---
 
@@ -315,10 +412,87 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - `--max-search-frames` 默认值由 `2400` 改为 `0`（不限制帧数）。
 - **原因：** 长片或目标较晚才出现时，默认不应因搜索窗口过短而直接退出；需要时可显式设为正整数做快速失败。
 
+### ZH-18. 严格模式球袜召回增强（降低漏检）
+- **问题：** 严格双带模式下，部分目标袜色（尤其白/黑袜在压缩或曝光波动下）可能出现单带占比偏低，导致漏检。
+- **处理：**
+  - 新增颜色感知的严格阈值下限：白/黑袜下限降至 `0.24`，其余颜色保持 `0.30`（同时仍受 `--sock-min-ratio` 约束）。
+  - 新增严格模式保守补偿判定：当一条膝带达标、另一条接近阈值时，仅在合并膝区占比也达标的情况下放行。
+- **效果：** 在困难颜色场景提升召回率，同时保留橙色标线抑制与占比门限，尽量避免误检回升。
+
+### ZH-19. 近球门控判定放宽（降低漏触发）
+- **问题：** 近球门控在实战中偏严，球框抖动、球框过小或远景尺度偏差会导致触发困难。
+- **处理：**
+  - 放宽“米到像素”换算：改用更宽松的人体尺度（`max(身高像素, 1.25*宽度像素)`）并增加容差系数。
+  - 扩大下肢/脚下持球区域判定范围。
+  - 距离判定从“仅球心到人框”改为“球框最近点到人框”，并叠加球半径与宽度边距补偿。
+- **效果：** 更容易满足近球条件，提升片段触发召回；同时仍保留目标有效性与连续帧门槛约束。
+
+### ZH-20. 球袜命中增加放大二次校验（降低误检）
+- **问题：** 原始分辨率下仍可能出现粗粒度颜色误命中，导致非目标球员被判为袜色命中。
+- **处理：** 将球袜判定改为两阶段：
+  - 第一阶段：按原尺度执行现有球袜匹配。
+  - 第二阶段：围绕候选球员构建局部放大区域，再执行一次袜色匹配，并使用略严格的阈值复核。
+- **效果：** 仅当两次都通过才判定命中，可有效抑制“远景/噪声导致的误检测”。
+
+### ZH-21. 袜色模式改为单帧触发（降低漏触发）
+- **变更：** 在 `--sock-color` 模式下，只要当前帧通过袜色校验并满足近球条件，即可触发，不再默认要求连续两帧。
+- **原因：** 引入放大二次校验后，命中可信度已提升，继续要求连续两帧会增加不必要的漏触发。
+- **效果：** 有效命中时触发更及时，同时仍受袜色校验与近球门控约束。
+
+### ZH-22. 号码识别改为两阶段校验（降低误检）
+- **变更：** 号码识别路径与袜色路径一致，改为“两次都通过才命中”。
+- **处理：**
+  - 第一阶段：原尺度 OCR 号码匹配。
+  - 第二阶段：围绕同一候选球员框做局部放大，再做一次 OCR 复核（置信度略收紧）。
+- **效果：** 可减少粗尺度 OCR 将非目标球员误读为目标号码而造成的误锁定。
+
+### ZH-23. 增加小腿确认带，抑制“手臂当腿”误检
+- **问题：** 个别帧中手臂/袖子颜色在膝部高度附近会干扰袜色判断，出现“把手臂当腿”的误检。
+- **处理：** 在原有膝部带/膝部 ROI 命中基础上，新增小腿中段确认带；只有小腿区域也有足够颜色证据才放行。
+- **效果：** 降低上肢颜色误入袜色证据链的概率，提升命中可信度。
+
+### ZH-24. 未命中时按秒跳帧，加速扫描
+- **变更：** 跟拍模式新增 `--skip-seconds-on-miss`（默认 `0.05`）。
+- **行为：** 当当前帧未识别到目标时，按配置秒数跳过后续帧，再进行下一次完整检测。
+- **效果：** 减少检测调用频次，加快长视频扫描；设置为 `0` 可关闭跳帧。
+
+### ZH-25. 聚焦目标区域放大复核，并下调默认跳帧
+- **问题：** 以整个人体为中心的放大复核可能引入无关区域；未命中默认跳 1 秒会增加漏检。
+- **处理：**
+  - 放大复核改为按任务聚焦：号码模式聚焦躯干号码区，袜色模式聚焦下肢袜色区，同时保证完整人框仍在 patch 内。
+  - 袜色二次复核阈值增量由 `+0.03` 下调为 `+0.01`，减少过严筛除。
+  - 小腿确认带上移，降低鞋面颜色污染。
+  - 未命中跳帧默认值下调为 `0.2s`，兼顾速度与召回。
+  - 未命中跳帧默认值进一步下调为 `0.05s`，减少短时关键动作漏检。
+- **效果：** 目标区域复核更精准，误把鞋色当袜色的风险下降，且召回更稳定。
+
+### ZH-26. 近球改为“球距不超过身高”并统一框标注
+- **变更：** 近球判定改为“球到人距离 <= 球员身高像素”即合格。
+- **细化：** 距离改为“球心到脚面线段（人框底边）”最短距离；阈值用“头到脚”的像素距离计算，去除较宽松捷径。
+- **可视化：** 取消头顶圆圈；导出命中帧和输出片段统一使用目标框标注。
+- **效果：** 近球规则更符合业务约定，且播放核验时标注样式一致、目标更易追踪。
+
+### ZH-27. 射门优先召回窗口与片段连续扩展
+- **变更：** 新增射门优先召回参数：
+  - `--ball-missing-grace-frames`：允许短时 1-2 帧无球检测仍维持近球状态。
+  - `--shot-relax-window-sec` + `--shot-relax-sock-delta` / `--shot-relax-ocr-delta`：在射门候选窗口里下调二次复核阈值。
+  - `--segment-extend-sec`：触发后在近球持续时允许片段短窗口连续扩展。
+- **效果：** 降低射门瞬间因丢球检测/阈值过严造成的漏检，并减少片段被割裂。
+
 ### 交叉引用到英文部分
 - 英文镜像内容： [Jump to English](#english)
 - 英文 CLI 快速表：[CLI quick reference (English)](#cli-quick-ref-en)
 - 橙色标线抑制（英文）：[EN-15](#en-15-orange-pitch-line-rejection-for-sock-color)
 - 肤色排除（英文）：[EN-16](#en-16-skin-tone-exclusion-for-sock-color-ratio)
 - 首次锁定搜索默认不限制（英文）：[EN-17](#en-17-default-unlimited-first-lock-search-window)
+- 严格模式球袜召回增强（英文）：[EN-18](#en-18-sock-color-recall-hardening-for-strict-mode)
+- 近球门控判定放宽（英文）：[EN-19](#en-19-near-ball-gating-made-more-tolerant)
+- 放大二次校验（英文）：[EN-20](#en-20-zoom-in-secondary-verification-for-sock-color-hits)
+- 袜色单帧触发（英文）：[EN-21](#en-21-single-frame-trigger-in-sock-color-mode)
+- 号码两阶段校验（英文）：[EN-22](#en-22-two-pass-verification-for-jersey-number-matching)
+- 小腿确认带（英文）：[EN-23](#en-23-shin-band-confirmation-to-suppress-arm-as-leg-false-hits)
+- 未命中跳帧加速（英文）：[EN-24](#en-24-miss-based-temporal-skipping-for-faster-scanning)
+- 目标聚焦放大复核（英文）：[EN-25](#en-25-target-focused-zoom-verification-and-softer-miss-skip-default)
+- 身高距离规则与统一框标注（英文）：[EN-26](#en-26-height-based-near-ball-rule-and-box-only-overlays)
+- 射门优先召回窗口（英文）：[EN-27](#en-27-shot-priority-recall-window-and-segment-continuation)
 
