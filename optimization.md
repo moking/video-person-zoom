@@ -39,6 +39,9 @@ This document lists all new features and optimizations implemented today, focuse
   - [EN-25. Target-focused zoom verification and softer miss-skip default](#en-25-target-focused-zoom-verification-and-softer-miss-skip-default)
   - [EN-26. Height-based near-ball rule and box-only overlays](#en-26-height-based-near-ball-rule-and-box-only-overlays)
   - [EN-27. Shot-priority recall window and segment continuation](#en-27-shot-priority-recall-window-and-segment-continuation)
+  - [EN-28. `--ball-near-meter` honored for near-ball gate (matches stderr cm line)](#en-28-ball-near-meter-honored-for-near-ball-gate-matches-stderr-cm-line)
+  - [EN-29. Sock recall loosened + shoe false-positive guard (≥12cm / other-palette above)](#en-29-sock-recall-loosened--shoe-false-positive-guard-12cm--other-palette-above)
+  - [EN-30. Orange sock vs yellow kit discrimination](#en-30-orange-sock-vs-yellow-kit-discrimination)
   - [Cross Reference to Chinese Section](#cross-reference-to-chinese-section)
 - [CLI 快速参考（中文）](#cli-quick-ref-zh)
 - [中文](#中文)
@@ -69,6 +72,9 @@ This document lists all new features and optimizations implemented today, focuse
   - [ZH-25. 聚焦目标区域放大复核，并下调默认跳帧](#zh-25-聚焦目标区域放大复核并下调默认跳帧)
   - [ZH-26. 近球改为“球距不超过身高”并统一框标注](#zh-26-近球改为球距不超过身高并统一框标注)
   - [ZH-27. 射门优先召回窗口与片段连续扩展](#zh-27-射门优先召回窗口与片段连续扩展)
+  - [ZH-28. `--ball-near-meter` 参与近球门控并与 stderr 厘米距离一致](#zh-28-ball-near-meter-参与近球门控并与-stderr-厘米距离一致)
+  - [ZH-29. 球袜放宽召回 + 球鞋误检双条件（上沿 12cm / 非目标袜色带）](#zh-29-球袜放宽召回--球鞋误检双条件上沿-12cm--非目标袜色带)
+  - [ZH-30. 橙袜与黄色球衣/裁判服区分](#zh-30-橙袜与黄色球衣裁判服区分)
   - [交叉引用到英文部分](#交叉引用到英文部分)
 
 ---
@@ -91,7 +97,8 @@ This document lists all new features and optimizations implemented today, focuse
 | `--sock-strict-mode` | `on` | `--sock-color` | `on`: knee upper **and** lower 5cm bands must match ([EN-2](#en-2-strict-sock-color-standard-knee-upperlower-dual-band-matching)). `off`: single band ([EN-4](#en-4-runtime-switch-for-strict-vs-relaxed-sock-detection)). |
 | `--sock-skin-exclude` | `strong` | `--sock-color` | Skin exclusion mode: `off`/`on`/`strong`; `strong` uses wider skin mask to further suppress lower-leg skin false positives ([EN-16](#en-16-skin-tone-exclusion-for-sock-color-ratio)). |
 | `--sock-recheck-every-frame` | `on` | `--sock-color` | Per-frame sock recheck to limit tracker drift ([EN-10](#en-10-optional-per-frame-sock-color-recheck-switch)). |
-| `--ball-near-meter` | `1.0` | `-n` or `--sock-color` | Near-ball distance in meters (approx. from bbox scale) ([EN-7](#en-7-configurable-near-ball-distance-threshold)). |
+| `--ball-near-meter` | `1.0` | `-n` or `--sock-color` | Near-ball max distance in **meters**; gate uses `distance_cm <= value × 100`, same scale as stderr sock-save logs ([EN-7](#en-7-configurable-near-ball-distance-threshold), [EN-28](#en-28-ball-near-meter-honored-for-near-ball-gate-matches-stderr-cm-line)). Ignored when `--segment-on-target-only` is set. |
+| `--segment-on-target-only` | off | `-n` or `--sock-color` | If set, segments trigger on valid target only; ball proximity/possession checks are skipped (streak/max-clips still apply). See [`feature.md`](./feature.md) FEAT-20260501-16. |
 | `--near-ball-streak-frames` | `2` | `-n` or `--sock-color` | Consecutive frames required before starting a clip ([EN-9](#en-9-consecutive-frame-confirmation-before-triggering-clips)). |
 | `--max-search-frames` | `0` | `-n` or `--sock-color` | Max frames from start to first successful lock; `0` = unlimited (default) ([EN-17](#en-17-default-unlimited-first-lock-search-window)). |
 | `--parallel-mode` | `auto` | Tracking | `auto` / `off` / `force` parallel chunk policy ([EN-12](#en-12-new-parallel-execution-policy-autoffforce)). |
@@ -272,6 +279,26 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
   - `--segment-extend-sec` to allow active segments to continue briefly while near-ball persists after trigger.
 - **Impact:** Improves capture of short shooting actions under ball-detection flicker and avoids clip fragmentation around trigger boundaries.
 
+### EN-28. `--ball-near-meter` honored for near-ball gate (matches stderr cm line)
+- **Problem:** Near-ball gating compared raw pixels to one body-height in px (`min_d <= near_px`) and **ignored** `--ball-near-meter`, so large values like `100` did nothing. stderr could print ~287cm while exported `--sock-save-frames` JPGs (which require near-ball) never appeared.
+- **Fix:** Near-ball now uses the same approximate cm distance as `[sock-save-frames]` logging (`_player_ball_distance_cm`, 175cm reference height per bbox). Pass when `distance_cm <= ball_near_meter * 100`.
+- **Default:** `--ball-near-meter 1.0` → **100cm** threshold (documented “meters”). To approximate the old one-body-height pixel cap (~175cm), use `--ball-near-meter 1.75`.
+
+### EN-29. Sock recall loosened + shoe false-positive guard (≥12cm / other-palette above)
+- **Primary gate (updated):** Knee upper/lower **dual bands are no longer required**. Both strict and relaxed modes use a **wider below-knee leg band** (小腿) for target-color ratio; strict mode only applies a **stricter scaled floor** via `_sock_strict_min_ratio`. This restores recall when knee ROIs miss.
+- **Recall tuning:** Lower shin ratio multipliers, slightly wider shin ROI horizontally/vertically, easier zoom second pass (`max(min_ratio-0.015, …)` vs a bump-up).
+- **Shoe guard (no new CLI):** After shin-band evidence passes, reject if:
+  1. In a below-knee strip, the **target-color** mask top is within **~15cm** of the foot line (box bottom, 1.75m scale)—shoe-only stripe; or
+  2. In a ~5cm band **above** that top edge, **non-target** sock-palette colors exceed **~11%** of valid (skin-masked) pixels (sock stripe above shoe).
+- Zoom-in verification uses **full-frame geometry** for shoe guard (`shoe_frame_bgr` / `shoe_xyxy`).
+
+### EN-30. Orange sock vs yellow kit discrimination
+- **Problem:** After shin-primary sock matching, yellow referee shirts / kits could satisfy orange HSV bleed or wrong ROI placement and lock as `--sock-color orange`.
+- **Mitigation:**
+  - Tightened built-in **orange** HSV wedge (`H∈[11,19]`, higher min S/V) to separate from **yellow** (`H≥22`).
+  - For orange targets only: if **yellow** ratio in the **same shin ROI** clearly exceeds **orange** (`yellow > orange + 0.007` and yellow ≥ ~8.8%), reject.
+  - For orange targets only: if **upper torso** strip (~top 10–42% of player box) shows **strong yellow** (ratio ≥ ~15%), reject (yellow shirt / bib).
+
 ### Cross Reference to Chinese Section
 - Chinese mirror for this section: [Jump to 中文](#中文)
 - CLI quick reference (Chinese): [CLI 快速参考（中文）](#cli-quick-ref-zh)
@@ -287,6 +314,10 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - Target-focused zoom and softer skip default (Chinese): [ZH-25](#zh-25-聚焦目标区域放大复核并下调默认跳帧)
 - Height-based near-ball and box overlay (Chinese): [ZH-26](#zh-26-近球改为球距不超过身高并统一框标注)
 - Shot-priority recall window (Chinese): [ZH-27](#zh-27-射门优先召回窗口与片段连续扩展)
+- `--ball-near-meter` gate vs cm logging (Chinese): [ZH-28](#zh-28-ball-near-meter-参与近球门控并与-stderr-厘米距离一致)
+- Sock shoe guard & recall loosening (Chinese): [ZH-29](#zh-29-球袜放宽召回--球鞋误检双条件上沿-12cm--非目标袜色带)
+- Orange vs yellow sock discrimination (Chinese): [ZH-30](#zh-30-橙袜与黄色球衣裁判服区分)
+- Orange vs yellow sock discrimination (English): [EN-30](#en-30-orange-sock-vs-yellow-kit-discrimination)
 
 ---
 
@@ -301,7 +332,8 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 | `--sock-strict-mode` | `on` | `--sock-color` | `on`：膝上+膝下 5cm 双带都命中（[ZH-2](#zh-2-严格球袜标准膝上膝下双带同时命中)）；`off`：单带（[ZH-4](#zh-4-严格宽松球袜识别开关)）。 |
 | `--sock-skin-exclude` | `strong` | `--sock-color` | 肤色排除模式：`off`/`on`/`strong`；`strong` 使用更宽肤色范围，进一步降低小腿肤色误判（[ZH-16](#zh-16-肤色排除降低小腿颜色误判球袜)）。 |
 | `--sock-recheck-every-frame` | `on` | `--sock-color` | 逐帧复核袜色，抑制跟丢漂移（[ZH-10](#zh-10-可选逐帧球袜复核开关)）。 |
-| `--ball-near-meter` | `1.0` | `-n` 或 `--sock-color` | 近球距离阈值（米，由框高近似换算）（[ZH-7](#zh-7-可配置近球距离阈值)）。 |
+| `--ball-near-meter` | `1.0` | `-n` 或 `--sock-color` | 近球最大距离（**米**）；门控条件为 `距离_cm ≤ 参数×100`，与 stderr 袜色日志厘米一致（[ZH-7](#zh-7-可配置近球距离阈值)、[ZH-28](#zh-28-ball-near-meter-参与近球门控并与-stderr-厘米距离一致)）。与 `--segment-on-target-only` 二选一有效时，以仅目标模式为准。 |
+| `--segment-on-target-only` | 关闭 | `-n` 或 `--sock-color` | 若指定，则只要目标有效即触发片段，不判近球/持球；仍受连续帧、片段上限等约束。见 [`feature.md`](./feature.md) FEAT-20260501-16。 |
 | `--near-ball-streak-frames` | `2` | `-n` 或 `--sock-color` | 连续满足近球条件后才触发片段（[ZH-9](#zh-9-连续帧确认后再触发片段)）。 |
 | `--max-search-frames` | `0` | `-n` 或 `--sock-color` | 从起点起多少帧内须首次锁定目标；`0` 不限制（默认）（[ZH-17](#zh-17-首次锁定搜索窗口默认不限制)）。 |
 | `--parallel-mode` | `auto` | 跟拍 | `auto` / `off` / `force` 并行策略（[ZH-12](#zh-12-并行策略开关autooffforce)）。 |
@@ -479,6 +511,23 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
   - `--segment-extend-sec`：触发后在近球持续时允许片段短窗口连续扩展。
 - **效果：** 降低射门瞬间因丢球检测/阈值过严造成的漏检，并减少片段被割裂。
 
+### ZH-28. `--ball-near-meter` 参与近球门控并与 stderr 厘米距离一致
+- **问题：** 近球判定曾用像素与「一身高等价」比较（`min_d <= near_px`），**未使用** `--ball-near-meter`，故设为 `100` 等也不生效；stderr 可打印约 287cm，但依赖近球的 `--sock-save-frames` 导出仍不会出现。
+- **修复：** 与 `[sock-save-frames]` 日志共用 `_player_ball_distance_cm`（框高→175cm 标尺）；当 `距离_cm ≤ ball_near_meter × 100` 时判定近球。
+- **默认：** `--ball-near-meter 1.0` 对应 **100cm** 阈值（文档单位：米）。若要接近旧版「不超过一身长」像素上限（约 175cm），可使用 `--ball-near-meter 1.75`。
+
+### ZH-29. 球袜放宽召回 + 球鞋误检双条件（上沿 12cm / 非目标袜色带）
+- **主判定（已更新）：** 不再要求膝上/膝下**双带**同时命中；严格/宽松均以**膝下小腿带**目标色占比为主，严格模式仅通过 `_sock_strict_min_ratio` 提高缩放基准；减轻膝部 ROI 漏检导致的整体失败。
+- **召回：** 降低小腿占比门槛、加宽小腿采样带、放大复核略放宽（相对 `--sock-min-ratio` 下浮而非上抬）。
+- **球鞋抑制（无新 CLI）：** 小腿通过后 `_sock_reject_likely_shoe`：
+  1. **距地高度：** 目标色上沿距脚底 **&lt;~15cm**（过低条带，偏鞋区）则拒绝；
+  2. **上方异色袜：** 上沿之上约 **5cm** 窄带内，非目标内置袜色在肤色有效像素中占比 **≥~11%** 则拒绝。
+- 放大复核仍用全画面坐标做球鞋几何判定。
+
+### ZH-30. 橙袜与黄色球衣/裁判服区分
+- **问题：** 小腿主判定 + 偏宽 ROI 后，黄衣裁判等易被橙色 HSV 串色或框偏移误判为 `--sock-color orange`。
+- **处理：** 内置橙色 HSV 收紧并与黄色分区（H 分界）；橙袜专用——小腿 ROI 内黄色占比明显高于橙色则拒绝；上躯干（约框高 10%–42%）黄色过强则拒绝（黄衣/背心）。
+
 ### 交叉引用到英文部分
 - 英文镜像内容： [Jump to English](#english)
 - 英文 CLI 快速表：[CLI quick reference (English)](#cli-quick-ref-en)
@@ -495,4 +544,7 @@ Parameter cheat sheet: [CLI quick reference (English)](#cli-quick-ref-en)
 - 目标聚焦放大复核（英文）：[EN-25](#en-25-target-focused-zoom-verification-and-softer-miss-skip-default)
 - 身高距离规则与统一框标注（英文）：[EN-26](#en-26-height-based-near-ball-rule-and-box-only-overlays)
 - 射门优先召回窗口（英文）：[EN-27](#en-27-shot-priority-recall-window-and-segment-continuation)
+- `--ball-near-meter` 门控与厘米一致（英文）：[EN-28](#en-28-ball-near-meter-honored-for-near-ball-gate-matches-stderr-cm-line)
+- 球袜球鞋抑制与召回（英文）：[EN-29](#en-29-sock-recall-loosened--shoe-false-positive-guard-12cm--other-palette-above)
+- 橙/黄球袜区分（英文）：[EN-30](#en-30-orange-sock-vs-yellow-kit-discrimination)
 

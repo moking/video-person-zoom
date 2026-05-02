@@ -163,6 +163,38 @@ Use this format for each new feature entry (append-only):
 - **CLI / API impact**: New optional tuning flags for near-ball grace, verification relaxation window, and post-trigger segment extension.
 - **Related optimization**: See [`optimization.md`](./optimization.md).
 
+### FEAT-20260501-15. stderr distance log with `--sock-save-frames`
+- **Date**: 2026-05-01
+- **Scope**: CLI, Debugging, Tracking
+- **What changed**: While `--sock-save-frames N` is enabled (`N > 0`), each frame with a valid target logs an approximate target-to-ball distance in centimeters to stderr (or reports no ball when none is detected).
+- **Why**: Inspect ball distance even when the player is not “near ball” under the internal threshold, without changing export rules for JPG saves.
+- **CLI / API impact**: No new flags; extra stderr lines when `--sock-save-frames` is on and a target is locked.
+- **Related optimization**: See [`optimization.md`](./optimization.md).
+
+### FEAT-20260501-16. Optional segment trigger without near-ball (`--segment-on-target-only`)
+- **Date**: 2026-05-01
+- **Scope**: CLI, Tracking, Output
+- **What changed**: Added `--segment-on-target-only` to start segment capture whenever the target is valid, ignoring ball proximity and ball-missing grace; `--near-ball-streak-frames`, `--max-clips`, and writer timing still apply.
+- **Why**: Some workflows need highlight clips of the locked player even when the ball is far or not detected.
+- **CLI / API impact**: New boolean flag (default off). In `process_video`, new `segment_on_target_only` parameter.
+- **Related optimization**: See [`optimization.md`](./optimization.md).
+
+### FEAT-20260501-17. Sock-color recall + built-in shoe false-positive filter
+- **Date**: 2026-05-01
+- **Scope**: Detection, Tracking
+- **What changed**: **Shin/calf (below-knee) band is the primary sock-color gate**; knee dual-band requirements removed. Relaxed internal shin ratio scaling; second-pass zoom uses a slightly lower effective threshold; shoe false-positive check uses **~15cm** foot proximity and **~11%** other-palette “above band” rule (see optimization log for details).
+- **Why**: Restore recall from knee-ROI misses while still filtering many shoe-color false positives.
+- **CLI / API impact**: No new flags; `--sock-strict-mode` now only tightens the shin-band ratio scale; `--sock-min-ratio` unchanged semantics but applies to the leg band path.
+- **Related optimization**: [EN-29 / ZH-29](./optimization.md#en-29-sock-recall-loosened--shoe-false-positive-guard-12cm--other-palette-above)
+
+### FEAT-20260501-18. Orange sock guard against yellow shirts (`--sock-color orange`)
+- **Date**: 2026-05-01
+- **Scope**: Detection (`--sock-color`)
+- **What changed**: Tighter default orange HSV wedge vs yellow; orange-only checks reject when yellow dominates the shin ROI vs orange, or when upper torso yellow ratio is high (referee / yellow kit false positives).
+- **Why**: Yellow tops were mis-locked as orange socks after shin-primary relaxation.
+- **CLI / API impact**: No new flags; orange built-in table entry only + runtime logic for orange targets.
+- **Related optimization**: [EN-30 / ZH-30](./optimization.md#en-30-orange-sock-vs-yellow-kit-discrimination)
+
 ## 中文条目
 
 ### FEAT-20260426-1. 球袜颜色目标跟拍模式
@@ -268,6 +300,38 @@ Use this format for each new feature entry (append-only):
 - **变更原因**: 在短时丢球检测或快速射门动作下减少漏检，并让触发后片段可连续延展。
 - **CLI / API 影响**: 提供近球容忍、候选窗口阈值放宽、片段延长预算等可调能力。
 - **关联优化**: 参见 [`optimization.md`](./optimization.md)。
+
+### FEAT-20260501-15. `--sock-save-frames` 输出目标与球距离（cm）
+- **日期**: 2026-05-01
+- **范围**: CLI、调试、跟拍
+- **变更内容**: 当 `--sock-save-frames N` 开启（`N > 0`）且当前帧目标有效时，向 stderr 打印该帧估算的目标球员与球距离（厘米）；若未检测到球则提示不可用。
+- **变更原因**: 在近球阈值之外仍需观察估算距离，且不改变仅“近球”才导出 JPG 的规则。
+- **CLI / API 影响**: 无新参数；在上述条件下增加 stderr 日志行。
+- **关联优化**: 参见 [`optimization.md`](./optimization.md)。
+
+### FEAT-20260501-16. 可选「仅目标」片段触发（`--segment-on-target-only`）
+- **日期**: 2026-05-01
+- **范围**: CLI、跟拍、输出
+- **变更内容**: 新增 `--segment-on-target-only`：只要当前帧目标球员有效即按原有逻辑累计触发片段，不要求近球/持球（不计丢球宽容）；仍受 `--near-ball-streak-frames`、`--max-clips`、写入并行与时间窗等约束。
+- **变更原因**: 球很远或未检出球时仍需要跟拍人物高光片段。
+- **CLI / API 影响**: 新增布尔开关（默认关闭）；`process_video` 增加参数 `segment_on_target_only`。
+- **关联优化**: 参见 [`optimization.md`](./optimization.md)。
+
+### FEAT-20260501-17. 球袜放宽识别并内置球鞋误检过滤
+- **日期**: 2026-05-01
+- **范围**: 检测、跟拍
+- **变更内容**: **主判定改为膝下小腿带目标色**（不再要求膝上/膝下双带）；放宽小腿占比与放大复核；球鞋启发式改为距脚底约 **15cm** 内条带、上方异色袜约 **11%** 等（详见 optimization）。
+- **变更原因**: 避免膝部 ROI 漏检导致整体不命中，同时保留球鞋过滤。
+- **CLI / API 影响**: 无新参数；`--sock-strict-mode` 仅收紧小腿占比缩放；`--sock-min-ratio` 仍为用户占比下限（作用于小腿带路径）。
+- **关联优化**: [ZH-29](./optimization.md#zh-29-球袜放宽召回--球鞋误检双条件上沿-12cm--非目标袜色带)
+
+### FEAT-20260501-18. 橙袜与黄色上衣误判抑制（`--sock-color orange`）
+- **日期**: 2026-05-01
+- **范围**: 检测（`--sock-color`）
+- **变更内容**: 收紧内置橙色 HSV 与黄色色相分界；仅在选择橙袜时：小腿带内黄色占比明显高于橙色、或上躯干黄条带占比过高则拒绝命中。
+- **变更原因**: 小腿主判定放宽后，黄衣裁判等易被锁为橙袜。
+- **CLI / API 影响**: 无新参数；仅内置橙色调色表与橙袜路径逻辑。
+- **关联优化**: [ZH-30](./optimization.md#zh-30-橙袜与黄色球衣裁判服区分)
 
 ## Cross Reference
 

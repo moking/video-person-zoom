@@ -279,6 +279,52 @@ def _point_rect_distance_px(px: float, py: float, rect: tuple[float, float, floa
     return float((dx * dx + dy * dy) ** 0.5)
 
 
+def _foot_line_ball_min_distance_px(
+    player_xyxy: tuple[float, float, float, float],
+    ball_boxes: list[tuple[float, float, float, float]],
+) -> tuple[float, float] | None:
+    """
+    Minimum pixel distance from any ball center to the foot line segment (bottom edge),
+    and the reference body height in px (head-to-foot segment length).
+    若无球则返回 None。
+    """
+    if not ball_boxes:
+        return None
+    x1, y1, x2, y2 = player_xyxy
+    hx = (x1 + x2) * 0.5
+    hy = y1
+    fx = hx
+    fy = y2
+    near_px = max(1.0, float(((fx - hx) ** 2 + (fy - hy) ** 2) ** 0.5))
+    best = float("inf")
+    for bx1, by1, bx2, by2 in ball_boxes:
+        bcx = (bx1 + bx2) * 0.5
+        bcy = (by1 + by2) * 0.5
+        foot_x = min(max(bcx, x1), x2)
+        foot_y = fy
+        d = float(((bcx - foot_x) ** 2 + (bcy - foot_y) ** 2) ** 0.5)
+        if d < best:
+            best = d
+    return (best, near_px)
+
+
+def _player_ball_distance_cm(
+    player_xyxy: tuple[float, float, float, float],
+    ball_boxes: list[tuple[float, float, float, float]],
+    *,
+    body_height_cm: float = 175.0,
+) -> float | None:
+    """
+    Approximate ball-to-foot-line distance in cm using the same 1.75 m body scale as sock ROI.
+    与球袜 ROI 相同的 1.75m 身高标尺，将球心到脚线距离换算为厘米。
+    """
+    stats = _foot_line_ball_min_distance_px(player_xyxy, ball_boxes)
+    if stats is None:
+        return None
+    min_d_px, ref_px = stats
+    return (min_d_px / ref_px) * float(body_height_cm)
+
+
 def _player_near_ball(
     player_xyxy: tuple[float, float, float, float],
     ball_boxes: list[tuple[float, float, float, float]],
@@ -287,28 +333,14 @@ def _player_near_ball(
     """
     True if player has the ball or is around configured meter distance from ball.
     当球在球员脚下/身体附近（持球）或在设定米数范围内时返回 True。
+    Uses the same bbox-scale cm estimate as `--sock-save-frames` logging and
+    `--ball-near-meter` (threshold = ``near_meter * 100`` cm).
+    与日志中的厘米距离及 ``--ball-near-meter`` 一致：阈值 = ``near_meter * 100`` cm。
     """
-    if not ball_boxes:
+    dist_cm = _player_ball_distance_cm(player_xyxy, ball_boxes)
+    if dist_cm is None:
         return False
-    x1, y1, x2, y2 = player_xyxy
-    hx = (x1 + x2) * 0.5
-    hy = y1
-    fx = hx
-    fy = y2
-    # Reference scale from head-to-foot pixel distance.
-    # 以“头到脚”的像素距离作为近球阈值尺度。
-    near_px = max(1.0, float(((fx - hx) ** 2 + (fy - hy) ** 2) ** 0.5))
-    for bx1, by1, bx2, by2 in ball_boxes:
-        bcx = (bx1 + bx2) * 0.5
-        bcy = (by1 + by2) * 0.5
-        # Distance from ball center to nearest point on player's foot line segment.
-        # 球心到“脚面线段（人框底边）”的最短距离。
-        foot_x = min(max(bcx, x1), x2)
-        foot_y = fy
-        d = float(((bcx - foot_x) ** 2 + (bcy - foot_y) ** 2) ** 0.5)
-        if d <= near_px:
-            return True
-    return False
+    return dist_cm <= float(near_meter) * 100.0
 
 
 def _sort_person_boxes(
@@ -1011,18 +1043,17 @@ def _sock_shin_band_xyxy(
     xyxy: tuple[float, float, float, float],
 ) -> tuple[int, int, int, int] | None:
     """
-    Mid-shin confirmation band (below knee) to suppress arm/sleeve confusion.
-    小腿中段确认带（膝下），用于抑制手臂/袖子误判。
+    Lower-leg / mid-shin band (below knee): primary ROI for sock-color ratio and shoe filtering.
+    小腿（膝下）采样带：袜色主判定区域；略增高覆盖以利召回。
     """
     fh, fw = int(frame_shape[0]), int(frame_shape[1])
     x1, y1, x2, y2 = xyxy
     pw = max(1.0, x2 - x1)
     ph = max(1.0, y2 - y1)
-    nx1 = max(0, int(x1 + 0.30 * pw))
-    nx2 = min(fw, int(x1 + 0.70 * pw))
-    # Keep band at mid-shin (above shoe area) to avoid shoe-color contamination.
-    cy = y1 + 0.79 * ph
-    hh = max(4.0, ph * (0.040 / 1.75))
+    nx1 = max(0, int(x1 + 0.28 * pw))
+    nx2 = min(fw, int(x1 + 0.72 * pw))
+    cy = y1 + 0.785 * ph
+    hh = max(5.0, ph * (0.062 / 1.75))
     ny1 = max(0, int(cy - hh))
     ny2 = min(fh, int(cy + hh))
     if nx2 <= nx1 + 8 or ny2 <= ny1 + 6:
@@ -1039,7 +1070,8 @@ def _sock_color_hsv_ranges(color_name: str) -> list[tuple[tuple[int, int, int], 
         "blue": [((100, 95, 55), (126, 255, 255))],
         "green": [((42, 90, 55), (86, 255, 255))],
         "yellow": [((22, 110, 100), (36, 255, 255))],
-        "orange": [((10, 120, 95), (20, 255, 255))],
+        # Narrow vs yellow (H≥22) to reduce yellow-shirt false positives; slightly higher S/V floors.
+        "orange": [((11, 128, 102), (19, 255, 255))],
         "purple": [((134, 90, 55), (164, 255, 255))],
         "pink": [((148, 75, 95), (179, 255, 255))],
         "white": [((0, 0, 205), (179, 40, 255))],
@@ -1087,12 +1119,296 @@ def _sock_orange_pitch_line_reject(mask) -> bool:
     return False
 
 
+# Built-in sock palette keys (must match `_sock_color_hsv_ranges`).
+_SOCK_PALETTE_COLORS: tuple[str, ...] = (
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "orange",
+    "purple",
+    "pink",
+    "white",
+    "black",
+)
+
+
+def _sock_skin_valid_mask(hsv, skin_mode: str) -> "object":
+    """Pixels considered non-skin for sock ratio denominators. / 非肤色有效像素掩码。"""
+    import cv2
+    import numpy as np
+
+    sm = str(skin_mode).strip().lower()
+    if sm == "strong":
+        skin1 = cv2.inRange(
+            hsv,
+            np.array((0, 18, 45), dtype=np.uint8),
+            np.array((26, 240, 255), dtype=np.uint8),
+        )
+        skin2 = cv2.inRange(
+            hsv,
+            np.array((156, 16, 45), dtype=np.uint8),
+            np.array((179, 240, 255), dtype=np.uint8),
+        )
+    else:
+        skin1 = cv2.inRange(
+            hsv,
+            np.array((0, 25, 55), dtype=np.uint8),
+            np.array((20, 210, 255), dtype=np.uint8),
+        )
+        skin2 = cv2.inRange(
+            hsv,
+            np.array((160, 20, 55), dtype=np.uint8),
+            np.array((179, 210, 255), dtype=np.uint8),
+        )
+    skin = cv2.bitwise_or(skin1, skin2)
+    return cv2.bitwise_not(skin)
+
+
+def _sock_union_non_target_masks(hsv, target_norm: str) -> "object":
+    """Union of HSV masks for all sock colors except the tracking target. / 除目标外的袜色并集。"""
+    import cv2
+    import numpy as np
+
+    out = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for name in _SOCK_PALETTE_COLORS:
+        if name == target_norm:
+            continue
+        for lo, hi in _sock_color_hsv_ranges(name):
+            cur = cv2.inRange(
+                hsv,
+                np.array(lo, dtype=np.uint8),
+                np.array(hi, dtype=np.uint8),
+            )
+            out = cv2.bitwise_or(out, cur)
+    return out
+
+
+def _sock_reject_likely_shoe(
+    frame_bgr,
+    xyxy: tuple[float, float, float, float],
+    color_name: str,
+    *,
+    skin_mode: str,
+    use_skin_exclude: bool,
+) -> bool:
+    """
+    Heuristic shoe false-positive rejection:
+    (1) Above the top of the target-color blob in the lower leg, another sock palette
+        color occupies enough of the band (typical sock band above colored shoe).
+    (2) The top edge of the target-color region is within ~12cm of the foot line
+        (ground proxy: bottom of person box), i.e. color sits in the shoe strip only.
+    Returns True => reject this sock match. / 判定为球鞋误检则返回 True。
+    """
+    import cv2
+    import numpy as np
+
+    if frame_bgr is None or frame_bgr.size == 0:
+        return False
+    fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    x1, y1, x2, y2 = xyxy
+    pw = max(1.0, x2 - x1)
+    ph = max(1.0, y2 - y1)
+    cnorm = _normalize_sock_color_target(color_name)
+    ranges = _sock_color_hsv_ranges(color_name)
+
+    nx1 = max(0, int(x1 + 0.28 * pw))
+    nx2 = min(fw, int(x1 + 0.72 * pw))
+    knee_y = y1 + 0.72 * ph
+    # Below-knee strip where shoe vs sock ambiguity matters (shin → foot).
+    ankle_y1 = max(0, int(knee_y))
+    ankle_y2 = min(fh, int(y2))
+    if nx2 <= nx1 + 8 or ankle_y2 <= ankle_y1 + 6:
+        return False
+
+    crop = frame_bgr[ankle_y1:ankle_y2, nx1:nx2]
+    if crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    tgt = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in ranges:
+        tgt = cv2.bitwise_or(
+            tgt,
+            cv2.inRange(
+                hsv,
+                np.array(lo, dtype=np.uint8),
+                np.array(hi, dtype=np.uint8),
+            ),
+        )
+    if use_skin_exclude:
+        valid = _sock_skin_valid_mask(hsv, skin_mode)
+        tgt_hit = cv2.bitwise_and(tgt, valid)
+        valid_cnt = float(np.count_nonzero(valid))
+        if valid_cnt <= 1e-6:
+            return False
+    else:
+        tgt_hit = tgt
+        valid_cnt = float(tgt.size)
+
+    tc = float(np.count_nonzero(tgt_hit))
+    if tc < 12.0:
+        return False
+
+    ys = np.where(tgt_hit > 0)[0]
+    top_local = int(np.min(ys))
+    top_global = ankle_y1 + top_local
+
+    # Cond 2: upper edge of target color within ~15cm of ground → likely shoe-only stripe.
+    vert_cm_per_px = 175.0 / ph
+    ground_to_top_cm = float(y2 - top_global) * vert_cm_per_px
+    if ground_to_top_cm < 15.0:
+        return True
+
+    # Cond 1: band immediately above target blob shows strong non-target sock palette.
+    band_px = max(3.0, ph * (5.0 / 1.75))
+    ab_y2 = top_global
+    ab_y1 = max(0, int(round(top_global - band_px)))
+    ab_y1 = max(ab_y1, int(y1))
+    if ab_y2 <= ab_y1 + 3:
+        return False
+    above = frame_bgr[ab_y1:ab_y2, nx1:nx2]
+    if above.size == 0:
+        return False
+    ah = cv2.cvtColor(above, cv2.COLOR_BGR2HSV)
+    if use_skin_exclude:
+        v_above = _sock_skin_valid_mask(ah, skin_mode)
+        v_amt = float(np.count_nonzero(v_above))
+        if v_amt < 24.0:
+            return False
+        other = _sock_union_non_target_masks(ah, cnorm)
+        hit_o = float(np.count_nonzero(cv2.bitwise_and(other, v_above)))
+        if hit_o / v_amt >= 0.11:
+            return True
+    else:
+        other = _sock_union_non_target_masks(ah, cnorm)
+        hit_o = float(np.count_nonzero(other))
+        denom = float(ah.shape[0] * ah.shape[1])
+        if denom > 0 and hit_o / denom >= 0.11:
+            return True
+    return False
+
+
 def _sock_strict_min_ratio(color_name: str, user_min_ratio: float) -> float:
-    """Strict per-band threshold with color-aware floor. / 严格模式每带阈值（颜色感知下限）。"""
+    """Floor used with `--sock-strict-mode` for shin-band ratio scaling. / 严格模式小腿占比缩放用下限。"""
     c = _normalize_sock_color_target(color_name)
-    # White/black socks are more sensitive to exposure/compression noise; use a slightly lower floor.
-    floor = 0.24 if c in {"white", "black"} else 0.30
+    floor = 0.22 if c in {"white", "black"} else 0.24
     return max(float(user_min_ratio), floor)
+
+
+def _sock_hsv_ratio_in_roi(
+    frame_bgr,
+    roi_xyxy: tuple[int, int, int, int],
+    ranges: list[tuple[tuple[int, int, int], tuple[int, int, int]]],
+    *,
+    skin_mode: str,
+    use_skin_exclude: bool,
+) -> float:
+    """Masked color ratio for arbitrary HSV range list (same skin handling as sock match). / 任意袜色范围占比。"""
+    import cv2
+    import numpy as np
+
+    x1, y1, x2, y2 = roi_xyxy
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in ranges:
+        mask = cv2.bitwise_or(
+            mask,
+            cv2.inRange(
+                hsv,
+                np.array(lo, dtype=np.uint8),
+                np.array(hi, dtype=np.uint8),
+            ),
+        )
+    if use_skin_exclude:
+        sm = str(skin_mode).strip().lower()
+        if sm == "strong":
+            skin1 = cv2.inRange(
+                hsv,
+                np.array((0, 18, 45), dtype=np.uint8),
+                np.array((26, 240, 255), dtype=np.uint8),
+            )
+            skin2 = cv2.inRange(
+                hsv,
+                np.array((156, 16, 45), dtype=np.uint8),
+                np.array((179, 240, 255), dtype=np.uint8),
+            )
+        else:
+            skin1 = cv2.inRange(
+                hsv,
+                np.array((0, 25, 55), dtype=np.uint8),
+                np.array((20, 210, 255), dtype=np.uint8),
+            )
+            skin2 = cv2.inRange(
+                hsv,
+                np.array((160, 20, 55), dtype=np.uint8),
+                np.array((179, 210, 255), dtype=np.uint8),
+            )
+        skin = cv2.bitwise_or(skin1, skin2)
+        valid = cv2.bitwise_not(skin)
+        total = float(np.count_nonzero(valid))
+        if total <= 0:
+            return 0.0
+        hit = float(np.count_nonzero(cv2.bitwise_and(mask, valid)))
+        return hit / total
+    return float(np.count_nonzero(mask)) / float(mask.size)
+
+
+def _sock_orange_reject_yellow_dominance(
+    frame_bgr,
+    shin_roi: tuple[int, int, int, int],
+    orange_sr: float,
+    *,
+    skin_mode: str,
+    use_skin_exclude: bool,
+) -> bool:
+    """
+    Orange sock target: reject when yellow-class pixels tie or beat orange in the shin ROI
+    (common with yellow kits / referee shirts if ROI or hue bleeds).
+    / 橙色袜：小腿带内黄色占比不低于橙色时拒绝。
+    """
+    yr = _sock_hsv_ratio_in_roi(
+        frame_bgr,
+        shin_roi,
+        _sock_color_hsv_ranges("yellow"),
+        skin_mode=skin_mode,
+        use_skin_exclude=use_skin_exclude,
+    )
+    # Yellow must clearly beat orange in the shin ROI (ties/noise keep orange).
+    return bool(yr > float(orange_sr) + 0.007 and yr >= 0.088)
+
+
+def _sock_orange_reject_torso_yellow(
+    frame_bgr,
+    xyxy: tuple[float, float, float, float],
+    *,
+    skin_mode: str,
+    use_skin_exclude: bool,
+) -> bool:
+    """
+    Strong yellow in upper-torso strip → likely yellow shirt/bib, not orange shin socks.
+    / 上躯干黄条带过强 → 多为黄衣裁判等，拒绝橙袜命中。
+    """
+    fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    x1, y1, x2, y2 = xyxy
+    ph = max(1.0, y2 - y1)
+    pw = max(1.0, x2 - x1)
+    nx1 = max(0, int(x1 + 0.24 * pw))
+    nx2 = min(fw, int(x1 + 0.76 * pw))
+    ny1 = max(0, int(y1 + 0.10 * ph))
+    ny2 = min(fh, int(y1 + 0.42 * ph))
+    if nx2 <= nx1 + 10 or ny2 <= ny1 + 8:
+        return False
+    yr = _sock_hsv_ratio_in_roi(
+        frame_bgr,
+        (nx1, ny1, nx2, ny2),
+        _sock_color_hsv_ranges("yellow"),
+        skin_mode=skin_mode,
+        use_skin_exclude=use_skin_exclude,
+    )
+    return yr >= 0.15
 
 
 def _sock_color_match_core(
@@ -1102,9 +1418,15 @@ def _sock_color_match_core(
     min_ratio: float,
     strict_mode: bool,
     skin_exclude: bool | str = True,
+    *,
+    shoe_frame_bgr=None,
+    shoe_xyxy: tuple[float, float, float, float] | None = None,
 ) -> bool:
     import cv2
     import numpy as np
+
+    shoe_fr = shoe_frame_bgr if shoe_frame_bgr is not None else frame_bgr
+    shoe_xy = shoe_xyxy if shoe_xyxy is not None else xyxy
 
     cnorm = _normalize_sock_color_target(color_name)
     ranges = _sock_color_hsv_ranges(color_name)
@@ -1169,63 +1491,44 @@ def _sock_color_match_core(
             return mask, 0.0
         return mask, float(np.count_nonzero(mask)) / total
 
-    if strict_mode:
-        bands = _sock_knee_bands_xyxy(frame_bgr.shape, xyxy)
-        if bands is None:
-            return False
-        strict_ratio = _sock_strict_min_ratio(cnorm, float(min_ratio))
-        um, upper_ratio = _roi_mask_ratio(bands[0])
-        upper_ok = upper_ratio >= strict_ratio
-        if use_line_guard and um is not None and _sock_orange_pitch_line_reject(um):
-            return False
-        lm, lower_ratio = _roi_mask_ratio(bands[1])
-        lower_ok = lower_ratio >= strict_ratio
-        if use_line_guard and lm is not None and _sock_orange_pitch_line_reject(lm):
-            return False
-        strict_hit = upper_ok and lower_ok
-        # Partial-occlusion fallback: one band passes, the other is close, and merged knee ROI still passes.
-        one_ok = upper_ok ^ lower_ok
-        weak_ratio = lower_ratio if upper_ok else upper_ratio
-        if (not strict_hit) and one_ok and weak_ratio >= strict_ratio * 0.58:
-            roi = _sock_roi_xyxy(frame_bgr.shape, xyxy)
-            if roi is not None:
-                m, r = _roi_mask_ratio(roi)
-                fallback_ratio = max(float(min_ratio), strict_ratio * 0.72)
-                if r >= fallback_ratio:
-                    if use_line_guard and m is not None and _sock_orange_pitch_line_reject(m):
-                        return False
-                    strict_hit = True
-        if not strict_hit:
-            return False
-        # Add shin confirmation to avoid sleeve/arm confusion near knee height.
-        shin = _sock_shin_band_xyxy(frame_bgr.shape, xyxy)
-        if shin is None:
-            return False
-        sm, sr = _roi_mask_ratio(shin)
-        shin_ratio = max(0.12, strict_ratio * 0.52)
-        if sr < shin_ratio:
-            return False
-        if use_line_guard and sm is not None and _sock_orange_pitch_line_reject(sm):
-            return False
-        return True
-
-    # Relaxed mode: one knee-centered band is enough.
-    roi = _sock_roi_xyxy(frame_bgr.shape, xyxy)
-    if roi is None:
-        return False
-    m, r = _roi_mask_ratio(roi)
-    if r < float(min_ratio):
-        return False
-    if use_line_guard and m is not None and _sock_orange_pitch_line_reject(m):
-        return False
+    # Primary rule (strict & relaxed): enough target color on lower leg (shin/calf band);
+    # knee dual-band path removed to improve recall. Shoe heuristic removes shoe false positives.
     shin = _sock_shin_band_xyxy(frame_bgr.shape, xyxy)
     if shin is None:
         return False
     sm, sr = _roi_mask_ratio(shin)
-    shin_ratio = max(0.10, float(min_ratio) * 0.58)
-    if sr < shin_ratio:
+    if strict_mode:
+        base = _sock_strict_min_ratio(cnorm, float(min_ratio))
+        need = max(0.048, float(base) * 0.32)
+    else:
+        need = max(0.038, float(min_ratio) * 0.30)
+    if sr < need:
         return False
+    if cnorm == "orange":
+        if _sock_orange_reject_yellow_dominance(
+            frame_bgr,
+            shin,
+            float(sr),
+            skin_mode=skin_mode,
+            use_skin_exclude=use_skin_exclude,
+        ):
+            return False
+        if _sock_orange_reject_torso_yellow(
+            frame_bgr,
+            xyxy,
+            skin_mode=skin_mode,
+            use_skin_exclude=use_skin_exclude,
+        ):
+            return False
     if use_line_guard and sm is not None and _sock_orange_pitch_line_reject(sm):
+        return False
+    if _sock_reject_likely_shoe(
+        shoe_fr,
+        shoe_xy,
+        color_name,
+        skin_mode=skin_mode,
+        use_skin_exclude=use_skin_exclude,
+    ):
         return False
     return True
 
@@ -1296,7 +1599,10 @@ def _sock_color_match(
     if zoom_pack is None:
         return False
     patch, local_box = zoom_pack
-    verify_ratio = min(0.95, max(float(min_ratio), float(min_ratio) + 0.01))
+    verify_ratio = min(
+        0.95,
+        max(float(min_ratio) * 0.97, float(min_ratio) - 0.015, 0.028),
+    )
     return _sock_color_match_core(
         patch,
         local_box,
@@ -1304,6 +1610,8 @@ def _sock_color_match(
         verify_ratio,
         strict_mode,
         skin_exclude,
+        shoe_frame_bgr=frame_bgr,
+        shoe_xyxy=xyxy,
     )
 
 
@@ -1623,6 +1931,7 @@ def process_video(
     shot_relax_sock_delta: float,
     shot_relax_ocr_delta: float,
     segment_extend_sec: float,
+    segment_on_target_only: bool = False,
     segment_name_prefix: str = "",
     segment_time_offset_sec: float = 0.0,
 ) -> list[str]:
@@ -1844,6 +2153,14 @@ def process_video(
     recent_out_frames: deque = deque(maxlen=max(1, pre_roll_frames + 1))
     near_ball_streak = 0
     required_near_ball_streak = 1 if use_sock_color else max(1, int(near_ball_streak_frames))
+    if segment_on_target_only:
+        print(
+            _b(
+                f"片段触发: 仅目标模式 — 连续 {required_near_ball_streak} 帧目标有效即触发片段（不判近球/持球）。",
+                f"Segment trigger: TARGET-ONLY — start after {required_near_ball_streak} consecutive frame(s) with valid target (near-ball/possession ignored).",
+            ),
+            file=sys.stderr,
+        )
     saved_sock_frames = 0
     sock_frames_dir = ""
     if use_sock_color and int(sock_match_frame_limit) > 0:
@@ -1876,16 +2193,16 @@ def process_video(
             strict_ratio_dbg = _sock_strict_min_ratio(sock_color or "", float(sock_min_ratio))
             print(
                 _b(
-                    f"球袜检测标准: 严格模式（膝上5cm+膝下5cm 双带都需命中），颜色={sock_color}，每带最小占比={strict_ratio_dbg:.2f}（白/黑色下限更宽松）；并启用单带接近阈值时的补偿判定。",
-                    f"Sock detection standard: STRICT (both knee-5cm and knee+5cm bands must match), color={sock_color}, min ratio per band={strict_ratio_dbg:.2f} (slightly lower floor for white/black), plus partial-band fallback.",
+                    f"球袜检测标准: 严格模式 — 以膝下小腿带目标色为主（更严的占比缩放），颜色={sock_color}，基准={strict_ratio_dbg:.2f}；附球鞋误检排除。",
+                    f"Sock detection: STRICT — lower-leg (below-knee) target-color band is primary (stricter ratio scale), color={sock_color}, base={strict_ratio_dbg:.2f}; shoe false-positive filter on.",
                 ),
                 file=sys.stderr,
             )
         else:
             print(
                 _b(
-                    f"球袜检测标准: 普通模式（膝盖±5cm 单带命中），颜色={sock_color}，最小占比={float(sock_min_ratio):.2f}。",
-                    f"Sock detection standard: RELAXED (single knee ±5cm band), color={sock_color}, min ratio={float(sock_min_ratio):.2f}.",
+                    f"球袜检测标准: 宽松模式 — 以膝下小腿带目标色为主，颜色={sock_color}，--sock-min-ratio={float(sock_min_ratio):.2f}；附球鞋误检排除。",
+                    f"Sock detection: RELAXED — lower-leg (below-knee) target-color band is primary, color={sock_color}, min ratio={float(sock_min_ratio):.2f}; shoe false-positive filter on.",
                 ),
                 file=sys.stderr,
             )
@@ -1896,13 +2213,14 @@ def process_video(
             ),
             file=sys.stderr,
         )
-        print(
-            _b(
-                f"近球触发标准: 连续 {required_near_ball_streak} 帧满足“目标有效且球员在球周围 {float(ball_near_meter):.2f} 米内/持球”才触发片段（袜色模式默认单帧即触发）。",
-                f"Near-ball trigger standard: start segment after {required_near_ball_streak} consecutive frame(s) where target is valid and within {float(ball_near_meter):.2f}m of ball/has possession (sock-color mode defaults to single-frame trigger).",
-            ),
-            file=sys.stderr,
-        )
+        if not segment_on_target_only:
+            print(
+                _b(
+                    f"近球触发标准: 连续 {required_near_ball_streak} 帧满足“目标有效且球员在球周围 {float(ball_near_meter):.2f} 米内/持球”才触发片段（袜色模式默认单帧即触发）。",
+                    f"Near-ball trigger standard: start segment after {required_near_ball_streak} consecutive frame(s) where target is valid and within {float(ball_near_meter):.2f}m of ball/has possession (sock-color mode defaults to single-frame trigger).",
+                ),
+                file=sys.stderr,
+            )
         print(
             _b(
                 f"球袜逐帧复核: {'开启' if sock_recheck_every_frame else '关闭'}。",
@@ -2160,16 +2478,40 @@ def process_video(
                 last_box = box
 
             x1, y1, x2, y2 = box
-            near_ball_raw = bool(target_valid_this_frame) and _player_near_ball(box, balls, ball_near_meter)
-            if near_ball_raw:
-                near_ball_this_frame = True
-                ball_missing_left = max(0, int(ball_missing_grace_frames))
-            elif bool(target_valid_this_frame) and (not balls) and ball_missing_left > 0:
-                near_ball_this_frame = True
-                ball_missing_left -= 1
-            else:
-                near_ball_this_frame = False
+            if segment_on_target_only:
+                near_ball_this_frame = bool(target_valid_this_frame)
                 ball_missing_left = 0
+            else:
+                near_ball_raw = bool(target_valid_this_frame) and _player_near_ball(
+                    box, balls, ball_near_meter
+                )
+                if near_ball_raw:
+                    near_ball_this_frame = True
+                    ball_missing_left = max(0, int(ball_missing_grace_frames))
+                elif bool(target_valid_this_frame) and (not balls) and ball_missing_left > 0:
+                    near_ball_this_frame = True
+                    ball_missing_left -= 1
+                else:
+                    near_ball_this_frame = False
+                    ball_missing_left = 0
+            if int(sock_match_frame_limit) > 0 and target_valid_this_frame:
+                dist_cm = _player_ball_distance_cm(box, balls)
+                if dist_cm is None:
+                    print(
+                        _b(
+                            f"[sock-save-frames] 帧 {frame_i}：目标有效，未检测到球（距离不可用）。",
+                            f"[sock-save-frames] frame {frame_i}: target valid, no ball detected (distance N/A).",
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        _b(
+                            f"[sock-save-frames] 帧 {frame_i}：目标球员与球距离约 {dist_cm:.1f} cm",
+                            f"[sock-save-frames] frame {frame_i}: target-to-ball distance ~ {dist_cm:.1f} cm",
+                        ),
+                        file=sys.stderr,
+                    )
             if (
                 int(sock_match_frame_limit) > 0
                 and saved_sock_frames < int(sock_match_frame_limit)
@@ -2407,8 +2749,16 @@ def process_video(
     if not saved_segments:
         raise SystemExit(
             _b(
-                "已识别到目标球员，但未出现持球/1米近球条件，未写出片段文件。",
-                "Target player was locked, but no possession/within-1m-ball moments were found, so no segment file was written.",
+                (
+                    "已识别到目标球员，但未写出片段（可能未连续满足帧数、已达片段上限或时间窗限制）。"
+                    if segment_on_target_only
+                    else "已识别到目标球员，但未出现持球/近球条件，未写出片段文件。"
+                ),
+                (
+                    "Target was locked, but no segment was written (streak threshold, max segments, or timing window)."
+                    if segment_on_target_only
+                    else "Target player was locked, but no possession/near-ball moments were found, so no segment file was written."
+                ),
             )
         )
     return saved_segments
@@ -2654,8 +3004,8 @@ def main() -> None:
         choices=("on", "off"),
         default="on",
         help=_b(
-            "球袜识别严格模式：on=膝上/膝下双带都要命中（更准）；off=单带命中（更宽松）",
-            "Sock strict mode: on=both knee upper/lower bands must match (stricter); off=single band match (looser)",
+            "球袜识别严格模式：on=小腿主判定时占比阈值更严；off=略松（均含球鞋误检排除）",
+            "Sock strict mode: on=stricter shin-band ratio scale; off=looser (both use shoe false-positive filter)",
         ),
     )
     p.add_argument(
@@ -2826,6 +3176,14 @@ def main() -> None:
         help=_b(
             "仅跟拍模式（-n 或 --sock-color）：球员与球距离阈值（米）；默认 1.0，越大越宽松",
             "Only in tracking mode (-n or --sock-color): player-ball distance threshold in meters; default 1.0 (larger is looser)",
+        ),
+    )
+    p.add_argument(
+        "--segment-on-target-only",
+        action="store_true",
+        help=_b(
+            "仅跟拍模式：只要目标球员有效即触发片段，不要求近球/持球（仍受连续帧数等限制）",
+            "Tracking only: start segments whenever the target is valid; ignore ball proximity (streak/max clips still apply)",
         ),
     )
     p.add_argument(
@@ -3212,6 +3570,7 @@ def main() -> None:
                 "shot_relax_sock_delta": float(args.shot_relax_sock_delta),
                 "shot_relax_ocr_delta": float(args.shot_relax_ocr_delta),
                 "segment_extend_sec": float(args.segment_extend_sec),
+                "segment_on_target_only": bool(args.segment_on_target_only),
             }
             parallel_mode = str(args.parallel_mode).strip().lower()
             req_chunks = int(args.parallel_chunks)
